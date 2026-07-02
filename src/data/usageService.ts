@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as https from "https";
+import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -196,10 +197,23 @@ export class UsageService {
   }
 
   private readToken(): { accessToken: string; expiresAt?: number } | undefined {
-    const file = this.credentialsPath();
+    // On macOS, Claude Code stores the OAuth blob in the login Keychain, not the
+    // credentials file (the file is often absent or a stale leftover). Prefer the
+    // fresher of the two so a rotated token in the Keychain wins over a stale file.
+    const fromFile = this.parseOauth(this.readCredentialsFile());
+    const fromKeychain = process.platform === "darwin" ? this.parseOauth(this.readKeychain()) : undefined;
+    if (fromFile && fromKeychain) {
+      return (fromKeychain.expiresAt ?? 0) >= (fromFile.expiresAt ?? 0) ? fromKeychain : fromFile;
+    }
+    return fromKeychain ?? fromFile;
+  }
+
+  private parseOauth(raw: string | undefined): { accessToken: string; expiresAt?: number } | undefined {
+    if (!raw) {
+      return undefined;
+    }
     try {
-      const data = JSON.parse(fs.readFileSync(file, "utf8"));
-      const o = data?.claudeAiOauth;
+      const o = JSON.parse(raw)?.claudeAiOauth;
       if (o?.accessToken) {
         let expiresAt: number | undefined;
         if (typeof o.expiresAt === "number") {
@@ -209,9 +223,33 @@ export class UsageService {
         return { accessToken: o.accessToken, expiresAt };
       }
     } catch {
-      // missing/unreadable credentials
+      // missing/unparseable credentials
     }
     return undefined;
+  }
+
+  private readCredentialsFile(): string | undefined {
+    try {
+      return fs.readFileSync(this.credentialsPath(), "utf8");
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Reads the OAuth blob from the macOS login Keychain. Same JSON shape as the
+  // credentials file. The token is never logged; only used as a request header.
+  private readKeychain(): string | undefined {
+    try {
+      const out = execFileSync(
+        "security",
+        ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        { encoding: "utf8", timeout: 5000 }
+      );
+      return typeof out === "string" && out.trim() ? out.trim() : undefined;
+    } catch {
+      // no matching keychain item, or user denied access
+      return undefined;
+    }
   }
 
   private credentialsPath(): string {
