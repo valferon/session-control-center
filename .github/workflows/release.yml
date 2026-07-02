@@ -1,0 +1,46 @@
+name: release
+
+# Trigger on version tags, e.g. `git tag v0.1.0 && git push --tags`
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build + package .vsix
+        run: pnpm package
+
+      - name: Attach .vsix to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.vsix"
+          generate_release_notes: true
+
+      - name: Publish to Open VSX
+        if: ${{ env.OVSX_PAT != '' }}
+        run: |
+          # namespace must match the "publisher" in package.json; ignore "already exists"
+          npx ovsx create-namespace valferon -p "$OVSX_PAT" || true
+          npx ovsx publish *.vsix -p "$OVSX_PAT"

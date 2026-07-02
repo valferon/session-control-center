@@ -1,4 +1,5 @@
 .vscode/**
+.github/**
 src/**
 webview-ui/**
 design/**
