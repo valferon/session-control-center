@@ -5,7 +5,8 @@ const KEY = "claudeControlCenter.seenSessions";
 // This window's own shard. Every window writes ONLY its own shard, so two
 // windows never write the same file and can never clobber each other. The
 // truth is the union of all shards, merged per-session by max(mtimeMs).
-const OWN_FILE = `seen-${vscode.env.sessionId}.json`;
+// (sessionId's format is unspecified — strip anything path-hostile.)
+const OWN_FILE = `seen-${vscode.env.sessionId.replace(/[^a-zA-Z0-9._-]/g, "")}.json`;
 // Matches OWN_FILE for every window AND the legacy single-file location
 // (seen-sessions.json), so old data folds into the union for free.
 const SHARD_GLOB = "seen-*.json";

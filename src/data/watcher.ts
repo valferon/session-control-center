@@ -11,10 +11,15 @@ type RescanEvent = () => void;
 export class ProjectsWatcher {
   private rootWatcher?: fs.FSWatcher;
   private dirWatchers = new Map<string, fs.FSWatcher>();
-  private fileTimers = new Map<string, NodeJS.Timeout>();
+  private fileTimers = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
   private rootTimer?: NodeJS.Timeout;
 
   private readonly fileDebounceMs = 500;
+  // Trailing debounce alone starves under a sustained write stream (an active
+  // session appends every few hundred ms, resetting the timer forever, so the
+  // UI freezes until the writes pause). Cap the total wait: once a file's
+  // events have been coalescing this long, fire even though writes continue.
+  private readonly fileMaxWaitMs = 2_000;
   private readonly rootDebounceMs = 800;
   private warnedLimit = false;
 
@@ -50,7 +55,7 @@ export class ProjectsWatcher {
     }
     this.dirWatchers.clear();
     for (const t of this.fileTimers.values()) {
-      clearTimeout(t);
+      clearTimeout(t.timer);
     }
     this.fileTimers.clear();
     if (this.rootTimer) {
@@ -115,16 +120,23 @@ export class ProjectsWatcher {
   }
 
   private debounceFile(filePath: string): void {
+    const now = Date.now();
     const existing = this.fileTimers.get(filePath);
     if (existing) {
-      clearTimeout(existing);
-    }
-    this.fileTimers.set(
-      filePath,
-      setTimeout(() => {
+      clearTimeout(existing.timer);
+      // Coalescing too long already — fire now instead of resetting again.
+      if (now - existing.firstAt >= this.fileMaxWaitMs) {
         this.fileTimers.delete(filePath);
         this.onFileChanged(filePath);
-      }, this.fileDebounceMs)
-    );
+        return;
+      }
+    }
+    this.fileTimers.set(filePath, {
+      firstAt: existing?.firstAt ?? now,
+      timer: setTimeout(() => {
+        this.fileTimers.delete(filePath);
+        this.onFileChanged(filePath);
+      }, this.fileDebounceMs),
+    });
   }
 }

@@ -59,11 +59,14 @@ export async function parseSessionFile(
       continue; // skip malformed / binary-ish lines
     }
     const type = rec.type;
-    // Only conversational records define real activity time. Non-conversational
-    // rewrites (file-history-snapshot, ai-title) carry timestamps too and would
+    // Only records that mark REAL liveness define activity time. Conversation
+    // (user/assistant) obviously; queue-operation = the human queued/removed a
+    // prompt; system = the harness did something (api_error retries, hook runs)
+    // proving the process is alive. Non-conversational REWRITES
+    // (file-history-snapshot, ai-title) carry timestamps too and would
     // otherwise push endedAt forward, causing false "active" status.
     const ts: string | undefined = rec.timestamp;
-    if (ts && (type === "user" || type === "assistant")) {
+    if (ts && (type === "user" || type === "assistant" || type === "system" || type === "queue-operation")) {
       if (!firstTs) {
         firstTs = ts;
       }
@@ -171,6 +174,16 @@ export async function parseSessionFile(
     } else if (type === "queue-operation") {
       if (typeof rec.operation === "string") {
         agg.lastQueueOp = rec.operation;
+        // Net queued-prompt depth. A clean-ended turn with prompts still queued
+        // is NOT "your move" — the harness will dequeue and keep working, so
+        // computeStatus treats depth > 0 as still active. Clamped: dequeue and
+        // remove balance enqueue, and a lost/duplicated record must not wedge
+        // the depth negative or permanently positive.
+        if (rec.operation === "enqueue") {
+          agg.queueDepth++;
+        } else if (rec.operation === "dequeue" || rec.operation === "remove") {
+          agg.queueDepth = Math.max(0, agg.queueDepth - 1);
+        }
       }
     }
   }
@@ -238,7 +251,20 @@ export function lastActivityMs(agg: Aggregates, mtimeMs: number): number {
 
 // stop_reason values that mean the assistant turn ended on its own (task done,
 // ball in the user's court). Anything else recent = a turn is still in flight.
+// Deliberately NOT here: "max_tokens" (output truncated — incomplete, so the
+// dangling path's recent=active → quiet=interrupted is the honest read) and
+// "pause_turn" (server paused a long turn; the harness auto-continues, so it
+// should read active while recent).
 const FINISHED_STOP_REASONS = new Set(["end_turn", "stop_sequence", "refusal"]);
+
+// How long a tail-of-file tool_use may sit unanswered before we stop believing
+// a tool is still running and call the session interrupted. Tool calls write
+// NOTHING to the jsonl while they run (a build, a subagent, a long MCP call can
+// legitimately take tens of minutes), so the ordinary activeMs window (default
+// 5 min) is far too eager — this was the main source of working sessions
+// mislabelled interrupted. Bounded so a window killed mid-tool still degrades
+// to interrupted rather than showing active for the whole idle window.
+const TOOL_RUNNING_GRACE_MS = 30 * 60_000;
 
 // Tool calls that pause the agent ON the user: it asked a question or requested
 // plan approval and cannot proceed until you respond. This is a genuine
@@ -247,7 +273,7 @@ const INPUT_PROMPT_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 
 export function computeStatus(
   lastActivityMs: number,
-  agg: Pick<Aggregates, "lastConvRole" | "lastStopReason" | "awaitingInput" | "interrupted">,
+  agg: Pick<Aggregates, "lastConvRole" | "lastStopReason" | "awaitingInput" | "interrupted" | "queueDepth">,
   thresholds: StatusThresholds,
   now: number
 ): SessionStatus {
@@ -276,14 +302,32 @@ export function computeStatus(
     !!agg.lastStopReason &&
     FINISHED_STOP_REASONS.has(agg.lastStopReason);
   if (age <= thresholds.activeMs) {
-    // Recent: a clean end = finished; a dangling turn = still actively working
-    // (a tool is running / the model is mid-stream).
-    return cleanEnd ? "finished" : "active";
+    // Recent. A clean end normally means finished — EXCEPT when prompts are
+    // still queued: the harness is about to dequeue the next one, so the
+    // session is mid-flight, not "your move". Without this, every turn boundary
+    // of a queued-up session flashes pendingReview until the dequeue lands.
+    // Depth is only trusted while recent: if the harness were alive it would
+    // have dequeued within seconds, so an old positive depth is stale noise.
+    if (cleanEnd) {
+      return agg.queueDepth > 0 ? "active" : "finished";
+    }
+    // Dangling turn = still actively working (a tool is running / mid-stream).
+    return "active";
   }
-  // Quiet but within the idle window: a clean end is "finished" (your move); a
-  // dangling turn that simply stopped getting written is "interrupted"
-  // (window died, API error, or an ESC with no marker) — incomplete, resumable.
-  return cleanEnd ? "finished" : "interrupted";
+  if (cleanEnd) {
+    return "finished";
+  }
+  // Dangling and quiet past activeMs. If the tail is an unanswered tool_use,
+  // a tool is (very likely) still executing — tool calls append nothing while
+  // they run, so silence here is normal. Stay active within the tool grace
+  // window instead of flapping to interrupted at activeMs.
+  const toolInFlight = agg.lastConvRole === "assistant" && agg.lastStopReason === "tool_use";
+  if (toolInFlight && age <= Math.max(TOOL_RUNNING_GRACE_MS, thresholds.activeMs)) {
+    return "active";
+  }
+  // A dangling turn that truly stopped getting written: window died, API error,
+  // or an ESC with no marker — incomplete, resumable.
+  return "interrupted";
 }
 
 // Claude Code writes a synthetic user text block when a turn is aborted. The

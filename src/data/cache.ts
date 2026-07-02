@@ -8,7 +8,7 @@ interface CacheEntry {
 }
 
 interface CacheFile {
-  version: 3;
+  version: 4;
   entries: Record<string, CacheEntry>; // key = filePath
 }
 
@@ -16,7 +16,9 @@ const CACHE_NAME = "session-cache.json";
 // v2: aggregates gained `awaitingInput`; discard v1 entries so status recomputes.
 // v3: cwd is now resolved to the git repo root (subdirs collapse onto the repo);
 //     discard v2 entries so cwd/grouping is recomputed.
-const CACHE_VERSION = 3 as const;
+// v4: aggregates gained `queueDepth` (and lastTs counts system/queue records);
+//     discard v3 entries so status inputs are re-derived.
+const CACHE_VERSION = 4 as const;
 
 // Persisted per-session aggregate cache, keyed by file path + (mtime,size).
 // Lives in globalStorageUri so it survives reloads and is trivially nukable.
@@ -79,10 +81,15 @@ export class SessionCache {
     };
     try {
       await vscode.workspace.fs.createDirectory(this.storageUri);
-      await vscode.workspace.fs.writeFile(
-        this.fileUri(),
-        Buffer.from(JSON.stringify(data), "utf8")
-      );
+      // Write-temp-then-rename so the cache file is swapped atomically. The
+      // cache is shared by every VS Code window; two windows flushing at once
+      // must never leave a torn/interleaved file behind (a torn file is
+      // recoverable — load() starts empty — but forces a full re-parse). The
+      // temp name embeds this window's id so concurrent flushes can't collide
+      // on the temp file either.
+      const tmp = vscode.Uri.joinPath(this.storageUri, `${CACHE_NAME}.tmp-${windowId()}`);
+      await vscode.workspace.fs.writeFile(tmp, Buffer.from(JSON.stringify(data), "utf8"));
+      await vscode.workspace.fs.rename(tmp, this.fileUri(), { overwrite: true });
     } catch {
       this.dirty = true; // retry on next flush
     }
@@ -91,4 +98,10 @@ export class SessionCache {
   private fileUri(): vscode.Uri {
     return vscode.Uri.joinPath(this.storageUri, CACHE_NAME);
   }
+}
+
+// Filesystem-safe id for this window (vscode.env.sessionId is unique per
+// window but its format is unspecified — strip anything path-hostile).
+function windowId(): string {
+  return vscode.env.sessionId.replace(/[^a-zA-Z0-9._-]/g, "");
 }

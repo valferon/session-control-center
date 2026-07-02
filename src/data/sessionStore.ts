@@ -18,6 +18,12 @@ export interface StoreConfig {
   thresholds: StatusThresholds;
 }
 
+// How recently the file must have been written for the downgrade grace to
+// apply (see finalStatus). Long enough to ride out a turn boundary (end_turn
+// written, next record lands a moment later); short enough that a genuinely
+// finished session settles by the next periodic re-scan.
+const HOT_FILE_GRACE_MS = 10_000;
+
 // Owns the in-memory session index, drives (cached) parsing, and exposes the
 // grouped/aggregated view plus a change event for the UI.
 export class SessionStore {
@@ -41,6 +47,35 @@ export class SessionStore {
       return "pendingReview";
     }
     return status;
+  }
+
+  // Seen overlay + downgrade grace, applied to every freshly computed status.
+  //
+  // The grace kills turn-boundary flicker: at the instant a turn's end_turn is
+  // the tail of the file (the next user/queue record is milliseconds away, or
+  // mid-write and skipped as a partial JSON line), a scan computes
+  // finished/pendingReview even though the session is mid-conversation. If the
+  // session was live a moment ago (prev active/awaiting) and the file is still
+  // hot (written < HOT_FILE_GRACE_MS ago), hold the previous live status; a
+  // real finish stops the writes, the file cools, and the very next re-scan
+  // (watcher event or the 30s tick) lets the downgrade through.
+  private finalStatus(
+    filePath: string,
+    computed: SessionStatus,
+    sessionId: string,
+    mtimeMs: number,
+    now: number
+  ): SessionStatus {
+    const overlaid = this.applySeenOverlay(computed, sessionId, mtimeMs);
+    const prev = this.sessions.get(filePath)?.status;
+    if (
+      (prev === "active" || prev === "awaiting") &&
+      (overlaid === "finished" || overlaid === "pendingReview") &&
+      now - mtimeMs < HOT_FILE_GRACE_MS
+    ) {
+      return prev;
+    }
+    return overlaid;
   }
 
   static readConfig(): StoreConfig {
@@ -138,7 +173,8 @@ export class SessionStore {
           // Reuse parse result; status depends on `now`, so recompute it.
           const session: Session = {
             ...cached,
-            status: this.applySeenOverlay(
+            status: this.finalStatus(
+              filePath,
               computeStatus(
                 lastActivityMs(cached.aggregates, st.mtimeMs),
                 cached.aggregates,
@@ -146,7 +182,8 @@ export class SessionStore {
                 now
               ),
               cached.sessionId,
-              st.mtimeMs
+              st.mtimeMs,
+              now
             ),
           };
           next.set(filePath, session);
@@ -165,7 +202,7 @@ export class SessionStore {
           this.cache.set(parsed);
           const session: Session = {
             ...parsed,
-            status: this.applySeenOverlay(parsed.status, parsed.sessionId, st.mtimeMs),
+            status: this.finalStatus(filePath, parsed.status, parsed.sessionId, st.mtimeMs, now),
           };
           next.set(filePath, session);
         } catch {
@@ -224,7 +261,8 @@ export class SessionStore {
     if (cached) {
       const session: Session = {
         ...cached,
-        status: this.applySeenOverlay(
+        status: this.finalStatus(
+          filePath,
           computeStatus(
             lastActivityMs(cached.aggregates, st.mtimeMs),
             cached.aggregates,
@@ -232,7 +270,8 @@ export class SessionStore {
             now
           ),
           cached.sessionId,
-          st.mtimeMs
+          st.mtimeMs,
+          now
         ),
       };
       this.sessions.set(filePath, session);
@@ -254,7 +293,7 @@ export class SessionStore {
       this.cache.set(parsed);
       const session: Session = {
         ...parsed,
-        status: this.applySeenOverlay(parsed.status, parsed.sessionId, st.mtimeMs),
+        status: this.finalStatus(filePath, parsed.status, parsed.sessionId, st.mtimeMs, now),
       };
       this.sessions.set(filePath, session);
       if (before !== session.status) {
@@ -372,7 +411,7 @@ function statusFactors(s: Session, thresholds: StatusThresholds, now: number): s
   const title = (s.title || s.lastPrompt || "").slice(0, 40);
   return (
     `${id} "${title}" | age=${ageS}s via=${endedOk ? "endedAt" : "mtime"} ` +
-    `role=${a.lastConvRole ?? "-"} stop=${a.lastStopReason ?? "-"} awaiting=${a.awaitingInput} interrupted=${a.interrupted} ` +
+    `role=${a.lastConvRole ?? "-"} stop=${a.lastStopReason ?? "-"} awaiting=${a.awaitingInput} interrupted=${a.interrupted} qd=${a.queueDepth} ` +
     `activeMs=${thresholds.activeMs} idleMs=${thresholds.idleMs} ` +
     `endedAt=${a.endedAt ?? "-"} mtime=${new Date(s.mtimeMs).toISOString()}`
   );

@@ -55,6 +55,9 @@ export interface Aggregates {
   filesTouched: number;
   prLinks: PrLink[];
   lastQueueOp?: string;
+  // Net queued prompts (enqueue minus dequeue/remove, floored at 0). >0 at a
+  // clean turn end means the harness has more work lined up — still active.
+  queueDepth: number;
   lastConvRole?: "user" | "assistant";
   lastStopReason?: string;
   // True when the final assistant turn ended on a tool that blocks on the user
@@ -74,6 +77,7 @@ export function emptyAggregates(): Aggregates {
     toolCallsByName: {},
     tokens: emptyTokens(),
     models: [],
+    queueDepth: 0,
     filesTouched: 0,
     prLinks: [],
     awaitingInput: false,

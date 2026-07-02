@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { ProjectGroup, Session, SessionStatus, UsageWindow } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
+import { lastActivityMs } from "../data/jsonlParser";
 import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
 import { SeenStore } from "../data/seenStore";
@@ -291,10 +292,23 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   }
 
   // The session open in THIS window: among sessions whose cwd relates to a
-  // current workspace folder, prefer working/awaiting, then most recently
-  // written. Match by containment (either direction): a session's cwd is the
-  // repo root while a workspace folder may be a subdir of it (or vice-versa),
-  // so exact equality misses the common case and nothing gets highlighted.
+  // current workspace folder, prefer LIVE (active/awaiting) over done
+  // (finished/pendingReview/interrupted) over stale (idle), then most recent
+  // REAL activity. Match by containment (either direction): a session's cwd is
+  // the repo root while a workspace folder may be a subdir of it (or
+  // vice-versa), so exact equality misses the common case and nothing gets
+  // highlighted.
+  //
+  // Two traps this ranking exists to avoid:
+  // - A live session mid-tool-call writes nothing for minutes; if done
+  //   sessions ranked equal, any session that finished meanwhile would steal
+  //   the highlight on raw recency.
+  // - Tie-break uses lastActivityMs (conversation time), NOT file mtime:
+  //   non-conversational rewrites (ai-title regen, snapshots) bump mtime and
+  //   would let a stale session win.
+  // Interrupted ranks with "done", not zero: an ESC'd session is usually
+  // exactly the one open in this window, and its interrupt marker is
+  // timestamped so recency carries it.
   private currentSessionId(): string | undefined {
     const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => normPath(f.uri.fsPath));
     if (folders.length === 0) {
@@ -302,23 +316,28 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     }
     let best: Session | undefined;
     let bestRank = -1;
-    let bestMtime = -1;
+    let bestActivity = -1;
     for (const g of this.store.getGroups()) {
       for (const s of g.sessions) {
         if (!s.cwd || !folders.some((f) => pathRelated(normPath(s.cwd!), f))) {
           continue;
         }
+        // Archived = explicitly buried; never "the current session" (and its
+        // row is usually hidden, which would make the highlight vanish).
+        if (this.archive.isArchived(s.sessionId)) {
+          continue;
+        }
         const rank =
-          s.status === "active" ||
-          s.status === "awaiting" ||
-          s.status === "pendingReview" ||
-          s.status === "finished"
-            ? 1
-            : 0;
-        if (rank > bestRank || (rank === bestRank && s.mtimeMs > bestMtime)) {
+          s.status === "active" || s.status === "awaiting"
+            ? 2
+            : s.status === "idle"
+              ? 0
+              : 1;
+        const activity = lastActivityMs(s.aggregates, s.mtimeMs);
+        if (rank > bestRank || (rank === bestRank && activity > bestActivity)) {
           best = s;
           bestRank = rank;
-          bestMtime = s.mtimeMs;
+          bestActivity = activity;
         }
       }
     }

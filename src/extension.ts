@@ -63,7 +63,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: () => watcher.dispose() });
 
   // Notifications on "finished work" transitions (active -> idle, new PR).
-  const notifier = new SessionNotifier(store, (id) => void openSession(store, context, id, seen));
+  const notifier = new SessionNotifier(store, context.globalStorageUri, (id) => void openSession(store, context, id, seen));
   context.subscriptions.push({ dispose: () => notifier.dispose() });
 
   // React immediately when the opt-in usage panel is toggled, instead of waiting
