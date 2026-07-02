@@ -12,10 +12,12 @@ import {
   openSession,
   openSessionFolder,
   purgeSession,
+  SessionRef,
   startClaudeInCwd,
 } from "./actions/sessionActions";
 import { SessionNotifier } from "./notifications/notifier";
 import { UsageService } from "./data/usageService";
+import { lastActivityMs } from "./data/jsonlParser";
 import { initLog, log } from "./util/log";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -90,15 +92,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const usageTick = setInterval(() => void usage.refresh(), 300_000);
   context.subscriptions.push({ dispose: () => clearInterval(usageTick) });
 
-  // Resolve a session id from a tree node or raw arg.
-  const sessionIdFrom = (arg: unknown): string | undefined => {
+  // Resolve a session reference from a tree node or raw arg. A tree node
+  // yields the exact Session object (unambiguous even when the same session id
+  // exists under two project dirs); the dashboard sends bare ids.
+  const sessionFrom = (arg: unknown): SessionRef | undefined => {
     if (arg instanceof SessionNode) {
-      return arg.session.sessionId;
+      return arg.session;
     }
     if (typeof arg === "string") {
       return arg;
     }
     return undefined;
+  };
+  const sessionIdFrom = (arg: unknown): string | undefined => {
+    const ref = sessionFrom(arg);
+    return typeof ref === "string" ? ref : ref?.sessionId;
   };
 
   context.subscriptions.push(
@@ -138,7 +146,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         .getGroups()
         .flatMap((g) => g.sessions)
         .filter((s) => s.status === "pendingReview")
-        .map((s) => ({ sessionId: s.sessionId, mtimeMs: s.mtimeMs }));
+        // Watermark = conversational activity, same clock as the overlay.
+        .map((s) => ({ sessionId: s.sessionId, atMs: lastActivityMs(s.aggregates, s.mtimeMs) }));
       if (pending.length === 0) {
         void vscode.window.showInformationMessage("No sessions pending review.");
         return;
@@ -168,14 +177,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("claudeControlCenter.openDashboard", () => {
       DashboardPanel.show(context.extensionUri, store, usage, {
-        openSession: (id) => void openSession(store, context, id, seen),
+        openSession: (id, newWindow) =>
+          void openSession(store, context, id, seen, { forceNewWindow: newWindow }),
         startClaude: (id) => void newConversationForSession(store, context, id),
       });
     }),
     vscode.commands.registerCommand("claudeControlCenter.openSession", (arg) => {
-      const id = sessionIdFrom(arg);
-      if (id) {
-        void openSession(store, context, id, seen);
+      const ref = sessionFrom(arg);
+      if (ref) {
+        void openSession(store, context, ref, seen);
       }
     }),
     vscode.commands.registerCommand("claudeControlCenter.newSessionInProject", (arg) => {
@@ -189,21 +199,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       initLog().show();
     }),
     vscode.commands.registerCommand("claudeControlCenter.openSessionFolderNewWindow", (arg) => {
-      const id = sessionIdFrom(arg);
-      if (id) {
-        void openSessionFolder(store, id, "newWindow");
+      const ref = sessionFrom(arg);
+      if (ref) {
+        void openSessionFolder(store, ref, "newWindow");
       }
     }),
     vscode.commands.registerCommand("claudeControlCenter.openSessionFolderHere", (arg) => {
-      const id = sessionIdFrom(arg);
-      if (id) {
-        void openSessionFolder(store, id, "currentWindow");
+      const ref = sessionFrom(arg);
+      if (ref) {
+        void openSessionFolder(store, ref, "currentWindow");
       }
     }),
     vscode.commands.registerCommand("claudeControlCenter.newConversationHere", (arg) => {
-      const id = sessionIdFrom(arg);
-      if (id) {
-        void newConversationForSession(store, context, id);
+      const ref = sessionFrom(arg);
+      if (ref) {
+        void newConversationForSession(store, context, ref);
       }
     }),
     vscode.commands.registerCommand("claudeControlCenter.copySessionId", (arg) => {
@@ -214,9 +224,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     vscode.commands.registerCommand("claudeControlCenter.deleteSession", (arg) => {
-      const id = sessionIdFrom(arg);
-      if (id) {
-        void purgeSession(store, id);
+      // Exact Session from the clicked row — a duplicated conversation must
+      // delete the copy the user pointed at, not whichever id lookup finds.
+      const ref = sessionFrom(arg);
+      if (ref) {
+        void purgeSession(store, ref);
       }
     })
   );
@@ -231,6 +243,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // If we just opened this window to reopen a session from another repo, do it.
   void consumePendingOpenSession(context);
+
+  // Also consume on focus: when the target repo is ALREADY open in another
+  // window, vscode.openFolder focuses that window instead of opening a new one,
+  // so no activation ever fires there and the pending action would rot.
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState((e) => {
+      if (e.focused) {
+        void consumePendingOpenSession(context);
+      }
+    })
+  );
 }
 
 export function deactivate(): void {

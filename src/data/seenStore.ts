@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import { Session } from "../model/types";
 
 const KEY = "claudeControlCenter.seenSessions";
 // This window's own shard. Every window writes ONLY its own shard, so two
@@ -17,11 +16,12 @@ const STALE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
 interface SeenFile {
   version: 1;
-  seen: Record<string, number>; // sessionId -> mtimeMs last opened at
+  seen: Record<string, number>; // sessionId -> activity watermark last opened at
 }
 
-// Persistent map of sessionId -> the session mtimeMs at the moment you last
-// opened it. Drives the finished (reviewed) vs pendingReview overlay.
+// Persistent map of sessionId -> the session's conversational watermark
+// (lastActivityMs) at the moment you last opened it. Drives the finished
+// (reviewed) vs pendingReview overlay.
 //
 // Sharded per window (seen-<sessionId>.json under globalStorageUri) rather than
 // a single shared file. A single shared file lost updates: every window kept
@@ -50,15 +50,20 @@ export class SeenStore {
   // old globalState location, then watch all shards for cross-window writes.
   async load(): Promise<void> {
     await this.mergeAllShards();
-    this.own = new Map(this.merged); // seed own from whatever we already knew
+    // `own` starts EMPTY: this window persists only the marks it makes itself.
+    // Seeding it from the union made every window rewrite the whole union into
+    // a fresh per-reload shard (the shard name embeds vscode.env.sessionId,
+    // which changes on every reload), growing storage O(reloads × sessions).
 
     // One-time migration: seed from the legacy globalState map so existing
-    // "checked" marks aren't lost on upgrade.
+    // "checked" marks aren't lost on upgrade. Compared against the merged
+    // union — once any shard carries the legacy values, later loads no-op
+    // instead of re-writing the legacy map into every new window's shard.
     if (this.legacyState) {
       const legacy = this.legacyState.get<Record<string, number>>(KEY, {});
       let changed = false;
       for (const [id, m] of Object.entries(legacy)) {
-        if ((this.own.get(id) ?? 0) < m) {
+        if ((this.merged.get(id) ?? 0) < m) {
           this.own.set(id, m);
           changed = true;
         }
@@ -96,45 +101,36 @@ export class SeenStore {
     this._onDidChange.fire();
   }
 
-  // A finished session is "unseen" when it has been written (finished) more
-  // recently than the last time you opened it. Only finished/pending-review
-  // sessions count — active/awaiting are self-evidently your move.
-  isUnseen(s: Session): boolean {
-    if (s.status !== "finished" && s.status !== "pendingReview") {
-      return false;
-    }
-    return s.mtimeMs > (this.merged.get(s.sessionId) ?? 0);
+  // Have you opened this session at or after this conversational watermark
+  // (lastActivityMs)? Drives the finished (reviewed) vs pendingReview overlay
+  // in SessionStore. Independent of Session.status so it can be consulted
+  // while status is still being computed.
+  isReviewed(sessionId: string, atMs: number): boolean {
+    return atMs <= (this.merged.get(sessionId) ?? 0);
   }
 
-  // Have you opened this session at or after its current mtime? Drives the
-  // finished (reviewed) vs pendingReview overlay in SessionStore. Independent of
-  // Session.status so it can be consulted while status is still being computed.
-  isReviewed(sessionId: string, mtimeMs: number): boolean {
-    return mtimeMs <= (this.merged.get(sessionId) ?? 0);
-  }
-
-  // Record that you've checked this session at its current mtime.
-  async markSeen(sessionId: string, mtimeMs: number): Promise<void> {
-    if ((this.own.get(sessionId) ?? 0) >= mtimeMs && (this.merged.get(sessionId) ?? 0) >= mtimeMs) {
+  // Record that you've checked this session at its current watermark.
+  async markSeen(sessionId: string, atMs: number): Promise<void> {
+    if ((this.own.get(sessionId) ?? 0) >= atMs && (this.merged.get(sessionId) ?? 0) >= atMs) {
       return;
     }
-    this.own.set(sessionId, Math.max(this.own.get(sessionId) ?? 0, mtimeMs));
-    this.merged.set(sessionId, Math.max(this.merged.get(sessionId) ?? 0, mtimeMs));
+    this.own.set(sessionId, Math.max(this.own.get(sessionId) ?? 0, atMs));
+    this.merged.set(sessionId, Math.max(this.merged.get(sessionId) ?? 0, atMs));
     await this.writeOwn();
     this._onDidChange.fire();
   }
 
   // Mark a batch of sessions checked in one write/event. Used by "mark all as
   // read". No-ops (single persist) if nothing actually changed.
-  async markAllSeen(items: ReadonlyArray<{ sessionId: string; mtimeMs: number }>): Promise<void> {
+  async markAllSeen(items: ReadonlyArray<{ sessionId: string; atMs: number }>): Promise<void> {
     let changed = false;
-    for (const { sessionId, mtimeMs } of items) {
-      if ((this.own.get(sessionId) ?? 0) < mtimeMs) {
-        this.own.set(sessionId, mtimeMs);
+    for (const { sessionId, atMs } of items) {
+      if ((this.own.get(sessionId) ?? 0) < atMs) {
+        this.own.set(sessionId, atMs);
         changed = true;
       }
-      if ((this.merged.get(sessionId) ?? 0) < mtimeMs) {
-        this.merged.set(sessionId, mtimeMs);
+      if ((this.merged.get(sessionId) ?? 0) < atMs) {
+        this.merged.set(sessionId, atMs);
         changed = true;
       }
     }

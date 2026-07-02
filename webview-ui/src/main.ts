@@ -100,8 +100,10 @@ function filteredSorted(): Array<{ s: Session; project: ProjectGroup }> {
   return rows;
 }
 
-// Metrics that honor the selected time range. "Active now" is range-independent
-// (it means right now); everything else is summed over sessions active in range.
+// Metrics that honor the selected time range: every tile is summed over the
+// sessions visible in that range, so the tiles agree with the table below.
+// Active/awaiting sessions always have recent activity (that's what makes them
+// live), so scoping them to the range never hides a genuinely live session.
 function rangeMetrics(): DashboardMetrics {
   const cutoff = Date.now() - RANGE_MS[state.range];
   let tokensSum = 0;
@@ -114,6 +116,9 @@ function rangeMetrics(): DashboardMetrics {
   let finishedSessions = 0;
   const projects = new Set<string>();
   for (const { s, project } of allRows()) {
+    if (activityMs(s) < cutoff) {
+      continue;
+    }
     if (s.status === "active") {
       activeSessions++;
     } else if (s.status === "awaiting") {
@@ -122,9 +127,6 @@ function rangeMetrics(): DashboardMetrics {
       pendingReviewSessions++;
     } else if (s.status === "finished") {
       finishedSessions++;
-    }
-    if (activityMs(s) < cutoff) {
-      continue;
     }
     totalSessions++;
     tokensSum += totalTokens(s);

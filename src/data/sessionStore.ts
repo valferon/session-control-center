@@ -42,8 +42,12 @@ export class SessionStore {
   // change) vs "finished" (already reviewed). This is a SeenStore overlay on top
   // of the jsonl-derived status; every place that stores/reads a Session status
   // goes through here so the tree, metrics and filters stay consistent.
-  private applySeenOverlay(status: SessionStatus, sessionId: string, mtimeMs: number): SessionStatus {
-    if (status === "finished" && !this.seen.isReviewed(sessionId, mtimeMs)) {
+  //
+  // Keyed on the CONVERSATIONAL watermark (lastActivityMs), not raw file mtime:
+  // non-conversational rewrites (ai-title regen, file-history snapshots) bump
+  // mtime and were flipping already-reviewed sessions back to pendingReview.
+  private applySeenOverlay(status: SessionStatus, sessionId: string, activityMs: number): SessionStatus {
+    if (status === "finished" && !this.seen.isReviewed(sessionId, activityMs)) {
       return "pendingReview";
     }
     return status;
@@ -63,10 +67,11 @@ export class SessionStore {
     filePath: string,
     computed: SessionStatus,
     sessionId: string,
+    activityMs: number,
     mtimeMs: number,
     now: number
   ): SessionStatus {
-    const overlaid = this.applySeenOverlay(computed, sessionId, mtimeMs);
+    const overlaid = this.applySeenOverlay(computed, sessionId, activityMs);
     const prev = this.sessions.get(filePath)?.status;
     if (
       (prev === "active" || prev === "awaiting") &&
@@ -95,13 +100,19 @@ export class SessionStore {
     return SessionStore.readConfig().projectsDir;
   }
 
+  // The same conversation can exist under multiple project dirs (a session
+  // moved/copied between repos), giving two Session objects with one sessionId.
+  // Prefer the most recently written copy so id-based actions (open, mark seen,
+  // delete-by-id from the dashboard) land on the live one, not whichever copy
+  // map iteration happens to yield first.
   getSession(sessionId: string): Session | undefined {
+    let best: Session | undefined;
     for (const s of this.sessions.values()) {
-      if (s.sessionId === sessionId) {
-        return s;
+      if (s.sessionId === sessionId && (!best || s.mtimeMs > best.mtimeMs)) {
+        best = s;
       }
     }
-    return undefined;
+    return best;
   }
 
   // Full reconcile of the projects dir. Coalesces concurrent calls.
@@ -171,17 +182,14 @@ export class SessionStore {
         const cached = this.cache.get(filePath, st.mtimeMs, st.size);
         if (cached) {
           // Reuse parse result; status depends on `now`, so recompute it.
+          const activity = lastActivityMs(cached.aggregates, st.mtimeMs);
           const session: Session = {
             ...cached,
             status: this.finalStatus(
               filePath,
-              computeStatus(
-                lastActivityMs(cached.aggregates, st.mtimeMs),
-                cached.aggregates,
-                cfg.thresholds,
-                now
-              ),
+              computeStatus(activity, cached.aggregates, cfg.thresholds, now),
               cached.sessionId,
+              activity,
               st.mtimeMs,
               now
             ),
@@ -202,7 +210,14 @@ export class SessionStore {
           this.cache.set(parsed);
           const session: Session = {
             ...parsed,
-            status: this.finalStatus(filePath, parsed.status, parsed.sessionId, st.mtimeMs, now),
+            status: this.finalStatus(
+              filePath,
+              parsed.status,
+              parsed.sessionId,
+              lastActivityMs(parsed.aggregates, st.mtimeMs),
+              st.mtimeMs,
+              now
+            ),
           };
           next.set(filePath, session);
         } catch {
@@ -259,17 +274,14 @@ export class SessionStore {
     const before = this.sessions.get(filePath)?.status;
     const cached = this.cache.get(filePath, st.mtimeMs, st.size);
     if (cached) {
+      const activity = lastActivityMs(cached.aggregates, st.mtimeMs);
       const session: Session = {
         ...cached,
         status: this.finalStatus(
           filePath,
-          computeStatus(
-            lastActivityMs(cached.aggregates, st.mtimeMs),
-            cached.aggregates,
-            cfg.thresholds,
-            now
-          ),
+          computeStatus(activity, cached.aggregates, cfg.thresholds, now),
           cached.sessionId,
+          activity,
           st.mtimeMs,
           now
         ),
@@ -293,7 +305,14 @@ export class SessionStore {
       this.cache.set(parsed);
       const session: Session = {
         ...parsed,
-        status: this.finalStatus(filePath, parsed.status, parsed.sessionId, st.mtimeMs, now),
+        status: this.finalStatus(
+          filePath,
+          parsed.status,
+          parsed.sessionId,
+          lastActivityMs(parsed.aggregates, st.mtimeMs),
+          st.mtimeMs,
+          now
+        ),
       };
       this.sessions.set(filePath, session);
       if (before !== session.status) {

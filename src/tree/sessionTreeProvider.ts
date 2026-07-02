@@ -82,6 +82,12 @@ export class SessionNode extends vscode.TreeItem {
     if (s.gitBranch) {
       bits.push(s.gitBranch);
     }
+    // Per-session model, so it's clear the usage panel's "default model" stat
+    // is a window default, not what every session runs on.
+    const model = shortModel(s.aggregates.models);
+    if (model) {
+      bits.push(model);
+    }
     return bits.join(" · ");
   }
 
@@ -370,6 +376,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
       if (u.sevenDayOpus) {
         nodes.push(usageNode("Opus weekly", "7d", u.sevenDayOpus));
       }
+      if (u.sevenDaySonnet) {
+        nodes.push(usageNode("Sonnet weekly", "7d", u.sevenDaySonnet));
+      }
       if (u.sevenDayFable) {
         nodes.push(usageNode("Fable weekly", "7d", u.sevenDayFable));
       }
@@ -381,10 +390,18 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     }
     }
 
-    // Currently selected model + reasoning effort (from settings.json).
+    // Currently selected model + reasoning effort (from settings.json). This is
+    // the WINDOW's default for new conversations — NOT per-session; each session
+    // row shows its own model in its description/tooltip. There is no API to
+    // set the model of an existing session from outside Claude Code; use
+    // /model inside the conversation.
     const sel = readModelSettings(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
     if (sel.model) {
-      nodes.push(new StatNode("model", sel.model, "chip", "charts.blue"));
+      const n = new StatNode("default model (this window)", sel.model, "chip", "charts.blue");
+      n.tooltip =
+        "Model selected in Claude settings.json — the default for NEW conversations in this window. " +
+        "Per-session models are shown on each session row. Change a running session's model with /model inside it.";
+      nodes.push(n);
     }
     if (sel.effort) {
       nodes.push(new StatNode("effort", sel.effort, "settings-gear"));
@@ -481,6 +498,20 @@ function relTime(ms: number): string {
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// Compact family name of the session's most-used model ("" when unknown).
+function shortModel(models: string[]): string {
+  if (models.length === 0) {
+    return "";
+  }
+  const m = models[0].toLowerCase();
+  for (const fam of ["opus", "sonnet", "haiku", "fable"]) {
+    if (m.includes(fam)) {
+      return fam;
+    }
+  }
+  return models[0];
 }
 
 function normPath(p: string): string {
