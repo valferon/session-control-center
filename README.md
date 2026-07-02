@@ -70,4 +70,3 @@ Open the activity-bar icon, or run **Claude Control Center: Open Dashboard**.
 ## License
 
 [MIT](./LICENSE)
-# session-control-center

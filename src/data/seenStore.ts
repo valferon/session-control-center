@@ -2,7 +2,17 @@ import * as vscode from "vscode";
 import { Session } from "../model/types";
 
 const KEY = "claudeControlCenter.seenSessions";
-const FILE_NAME = "seen-sessions.json";
+// This window's own shard. Every window writes ONLY its own shard, so two
+// windows never write the same file and can never clobber each other. The
+// truth is the union of all shards, merged per-session by max(mtimeMs).
+const OWN_FILE = `seen-${vscode.env.sessionId}.json`;
+// Matches OWN_FILE for every window AND the legacy single-file location
+// (seen-sessions.json), so old data folds into the union for free.
+const SHARD_GLOB = "seen-*.json";
+const LEGACY_FILE = "seen-sessions.json";
+// Prune shards from windows that haven't written in this long, so dead
+// windows' files don't accumulate forever.
+const STALE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
 interface SeenFile {
   version: 1;
@@ -12,55 +22,59 @@ interface SeenFile {
 // Persistent map of sessionId -> the session mtimeMs at the moment you last
 // opened it. Drives the finished (reviewed) vs pendingReview overlay.
 //
-// Stored in a JSON file under globalStorageUri (NOT globalState) so it can be
-// watched: globalState is a per-window in-memory Memento with no cross-window
-// change event, so a session marked seen in one window would stay pendingReview
-// in every other open window. The file + FileSystemWatcher makes every window
-// react the moment any window records a "seen".
+// Sharded per window (seen-<sessionId>.json under globalStorageUri) rather than
+// a single shared file. A single shared file lost updates: every window kept
+// its own in-memory copy and wrote the WHOLE map back, so a window writing from
+// a stale copy would clobber another window's just-recorded "seen". With one
+// shard per window there is exactly one writer per file, so writes never race;
+// the merged truth is the union of all shards (per-session max mtimeMs), which
+// is a grow-only CRDT and converges regardless of write order. A
+// FileSystemWatcher over every shard makes each window re-merge the instant any
+// window records a "seen".
 export class SeenStore {
-  private seen = new Map<string, number>();
+  // Union of all shards; what every query reads.
+  private merged = new Map<string, number>();
+  // Just this window's shard; what we persist.
+  private own = new Map<string, number>();
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange = this._onDidChange.event;
   private watcher?: vscode.FileSystemWatcher;
-  // Serialized snapshot of our last write, so the watcher can ignore the event
-  // caused by our own persist() and only react to other windows' writes.
-  private lastWritten = "";
 
   constructor(
     private readonly storageUri: vscode.Uri,
     private readonly legacyState?: vscode.Memento
   ) {}
 
-  // Load from disk (migrating one-time from the old globalState location) and
-  // start watching the file for writes from other windows.
+  // Load our own shard + merge every shard on disk, migrate one-time from the
+  // old globalState location, then watch all shards for cross-window writes.
   async load(): Promise<void> {
-    let loaded = false;
-    try {
-      const buf = await vscode.workspace.fs.readFile(this.fileUri());
-      const parsed = JSON.parse(Buffer.from(buf).toString("utf8")) as SeenFile;
-      if (parsed.version === 1 && parsed.seen) {
-        this.seen = new Map(Object.entries(parsed.seen));
-        loaded = true;
-      }
-    } catch {
-      // no file yet or corrupt
-    }
+    await this.mergeAllShards();
+    this.own = new Map(this.merged); // seed own from whatever we already knew
+
     // One-time migration: seed from the legacy globalState map so existing
-    // "checked" marks aren't lost on upgrade, then persist to the file.
-    if (!loaded && this.legacyState) {
+    // "checked" marks aren't lost on upgrade.
+    if (this.legacyState) {
       const legacy = this.legacyState.get<Record<string, number>>(KEY, {});
-      if (Object.keys(legacy).length > 0) {
-        this.seen = new Map(Object.entries(legacy));
-        await this.write();
+      let changed = false;
+      for (const [id, m] of Object.entries(legacy)) {
+        if ((this.own.get(id) ?? 0) < m) {
+          this.own.set(id, m);
+          changed = true;
+        }
+      }
+      if (changed) {
+        await this.writeOwn();
+        this.mergeInto(this.own);
       }
     }
+
+    await this.pruneStaleShards();
     this.startWatching();
   }
 
   private startWatching(): void {
-    // Pattern-scoped watcher for just our file inside the storage dir.
     this.watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(this.storageUri, FILE_NAME)
+      new vscode.RelativePattern(this.storageUri, SHARD_GLOB)
     );
     const reload = () => void this.reloadFromDisk();
     this.watcher.onDidChange(reload);
@@ -68,24 +82,16 @@ export class SeenStore {
     this.watcher.onDidDelete(reload);
   }
 
+  // Re-merge every shard from disk and notify if the union changed.
   private async reloadFromDisk(): Promise<void> {
-    let text = "";
-    try {
-      const buf = await vscode.workspace.fs.readFile(this.fileUri());
-      text = Buffer.from(buf).toString("utf8");
-    } catch {
-      // deleted: fall through to empty map
-    }
-    // Ignore the change event triggered by our own write.
-    if (text === this.lastWritten) {
+    const before = this.merged;
+    const next = await this.readAllShards();
+    // Our own writes are already reflected in this.merged; skip the event when
+    // nothing actually changed so we don't churn listeners on our own writes.
+    if (mapsEqual(before, next)) {
       return;
     }
-    try {
-      const parsed = JSON.parse(text) as SeenFile;
-      this.seen = new Map(Object.entries(parsed.seen ?? {}));
-    } catch {
-      this.seen = new Map();
-    }
+    this.merged = next;
     this._onDidChange.fire();
   }
 
@@ -96,23 +102,24 @@ export class SeenStore {
     if (s.status !== "finished" && s.status !== "pendingReview") {
       return false;
     }
-    return s.mtimeMs > (this.seen.get(s.sessionId) ?? 0);
+    return s.mtimeMs > (this.merged.get(s.sessionId) ?? 0);
   }
 
   // Have you opened this session at or after its current mtime? Drives the
   // finished (reviewed) vs pendingReview overlay in SessionStore. Independent of
   // Session.status so it can be consulted while status is still being computed.
   isReviewed(sessionId: string, mtimeMs: number): boolean {
-    return mtimeMs <= (this.seen.get(sessionId) ?? 0);
+    return mtimeMs <= (this.merged.get(sessionId) ?? 0);
   }
 
   // Record that you've checked this session at its current mtime.
   async markSeen(sessionId: string, mtimeMs: number): Promise<void> {
-    if (this.seen.get(sessionId) === mtimeMs) {
+    if ((this.own.get(sessionId) ?? 0) >= mtimeMs && (this.merged.get(sessionId) ?? 0) >= mtimeMs) {
       return;
     }
-    this.seen.set(sessionId, mtimeMs);
-    await this.write();
+    this.own.set(sessionId, Math.max(this.own.get(sessionId) ?? 0, mtimeMs));
+    this.merged.set(sessionId, Math.max(this.merged.get(sessionId) ?? 0, mtimeMs));
+    await this.writeOwn();
     this._onDidChange.fire();
   }
 
@@ -121,15 +128,19 @@ export class SeenStore {
   async markAllSeen(items: ReadonlyArray<{ sessionId: string; mtimeMs: number }>): Promise<void> {
     let changed = false;
     for (const { sessionId, mtimeMs } of items) {
-      if (this.seen.get(sessionId) !== mtimeMs) {
-        this.seen.set(sessionId, mtimeMs);
+      if ((this.own.get(sessionId) ?? 0) < mtimeMs) {
+        this.own.set(sessionId, mtimeMs);
+        changed = true;
+      }
+      if ((this.merged.get(sessionId) ?? 0) < mtimeMs) {
+        this.merged.set(sessionId, mtimeMs);
         changed = true;
       }
     }
     if (!changed) {
       return;
     }
-    await this.write();
+    await this.writeOwn();
     this._onDidChange.fire();
   }
 
@@ -138,15 +149,106 @@ export class SeenStore {
     this._onDidChange.dispose();
   }
 
-  private fileUri(): vscode.Uri {
-    return vscode.Uri.joinPath(this.storageUri, FILE_NAME);
+  // --- shard IO ---
+
+  private ownUri(): vscode.Uri {
+    return vscode.Uri.joinPath(this.storageUri, OWN_FILE);
   }
 
-  private async write(): Promise<void> {
-    const payload: SeenFile = { version: 1, seen: Object.fromEntries(this.seen) };
-    const text = JSON.stringify(payload);
-    this.lastWritten = text;
+  private async writeOwn(): Promise<void> {
+    const payload: SeenFile = { version: 1, seen: Object.fromEntries(this.own) };
     await vscode.workspace.fs.createDirectory(this.storageUri);
-    await vscode.workspace.fs.writeFile(this.fileUri(), Buffer.from(text, "utf8"));
+    await vscode.workspace.fs.writeFile(
+      this.ownUri(),
+      Buffer.from(JSON.stringify(payload), "utf8")
+    );
   }
+
+  // Read + union-merge every shard on disk into a fresh map.
+  private async readAllShards(): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    let entries: [string, vscode.FileType][] = [];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(this.storageUri);
+    } catch {
+      return out; // storage dir not created yet
+    }
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.File || !isShard(name)) {
+        continue;
+      }
+      try {
+        const buf = await vscode.workspace.fs.readFile(
+          vscode.Uri.joinPath(this.storageUri, name)
+        );
+        const parsed = JSON.parse(Buffer.from(buf).toString("utf8")) as SeenFile;
+        for (const [id, m] of Object.entries(parsed.seen ?? {})) {
+          if ((out.get(id) ?? 0) < m) {
+            out.set(id, m);
+          }
+        }
+      } catch {
+        // missing/corrupt shard: skip it, other shards still count
+      }
+    }
+    return out;
+  }
+
+  private async mergeAllShards(): Promise<void> {
+    this.merged = await this.readAllShards();
+  }
+
+  private mergeInto(src: Map<string, number>): void {
+    for (const [id, m] of src) {
+      if ((this.merged.get(id) ?? 0) < m) {
+        this.merged.set(id, m);
+      }
+    }
+  }
+
+  // Delete other windows' shards not modified within STALE_MS. Never touches
+  // our own shard or the legacy file (legacy has no window to rewrite it, but
+  // it's small and harmless to keep).
+  private async pruneStaleShards(): Promise<void> {
+    let entries: [string, vscode.FileType][] = [];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(this.storageUri);
+    } catch {
+      return;
+    }
+    const cutoff = Date.now() - STALE_MS;
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.File || !isShard(name)) {
+        continue;
+      }
+      if (name === OWN_FILE || name === LEGACY_FILE) {
+        continue;
+      }
+      const uri = vscode.Uri.joinPath(this.storageUri, name);
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.mtime < cutoff) {
+          await vscode.workspace.fs.delete(uri);
+        }
+      } catch {
+        // racing another window's prune/write: ignore
+      }
+    }
+  }
+}
+
+function isShard(name: string): boolean {
+  return /^seen-.*\.json$/.test(name);
+}
+
+function mapsEqual(a: Map<string, number>, b: Map<string, number>): boolean {
+  if (a.size !== b.size) {
+    return false;
+  }
+  for (const [k, v] of a) {
+    if (b.get(k) !== v) {
+      return false;
+    }
+  }
+  return true;
 }
