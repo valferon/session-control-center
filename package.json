@@ -2,7 +2,7 @@
   "name": "session-control-center",
   "displayName": "Session Control Center for Claude Code",
   "description": "Unofficial control center for local Claude Code sessions across all your repos: live sidebar, searchable dashboard, one-click context switch. Not affiliated with Anthropic.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "valferon",
   "license": "MIT",
   "icon": "icons/icon.png",
