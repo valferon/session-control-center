@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
+      # pnpm 11 treats un-approved dependency build scripts as a fatal error.
+      # esbuild bundles fine without them, so downgrade to a warning.
+      PNPM_CONFIG_STRICT_DEP_BUILDS: "false"
     steps:
       - uses: actions/checkout@v4
 
