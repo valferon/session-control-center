@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#181a1f"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="25.5" fill="none" stroke="#2c313a" stroke-width="1"/>
+  <!-- three session rows, each a status dot + a title bar -->
+  <g>
+    <circle cx="36" cy="42" r="8" fill="#3fb950"/>
+    <rect x="52" y="37" width="50" height="10" rx="5" fill="#3a4048"/>
+  </g>
+  <g>
+    <circle cx="36" cy="66" r="8" fill="#4493f8"/>
+    <rect x="52" y="61" width="62" height="10" rx="5" fill="#3a4048"/>
+  </g>
+  <g>
+    <circle cx="36" cy="90" r="8" fill="#bc8cff"/>
+    <rect x="52" y="85" width="40" height="10" rx="5" fill="#3a4048"/>
+  </g>
+</svg>

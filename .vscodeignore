@@ -1,0 +1,15 @@
+.vscode/**
+src/**
+webview-ui/**
+design/**
+icons/icon.svg
+*.vsix
+node_modules/**
+.gitignore
+tsconfig.json
+esbuild.mjs
+**/*.map
+**/*.ts
+pnpm-lock.yaml
+pnpm-workspace.yaml
+!dist/**

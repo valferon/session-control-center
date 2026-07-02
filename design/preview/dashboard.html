@@ -1,0 +1,154 @@
+<!-- @dsCard group="Screens" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 18px; background: var(--bg-canvas); color: var(--fg-primary); font-family: var(--font-sans); font-size: 12.5px; }
+
+  .topbar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+  .brand-title { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; }
+  .brand-sub { font-size: 11px; color: var(--fg-tertiary); }
+  .live { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--success); text-transform: uppercase; letter-spacing: 0.06em; margin-left: 9px; }
+  .live .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 0 var(--success-soft); animation: pulse 2s infinite; }
+  @keyframes pulse { 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  .spacer { margin-left: auto; }
+  .tabs { display: flex; gap: 2px; background: var(--bg-surface); border: 1px solid var(--border-soft); border-radius: 8px; padding: 2px; }
+  .tabs button { background: transparent; border: none; border-radius: var(--radius-sm); padding: 5px 11px; font-size: 11.5px; color: var(--fg-tertiary); cursor: pointer; font-family: inherit; }
+  .tabs button.active { background: var(--bg-surface-2); color: var(--fg-primary); }
+  .btn { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 12px; font-size: 11.5px; color: var(--fg-primary); cursor: pointer; font-family: inherit; }
+  .updated { font-size: 11px; color: var(--fg-tertiary); }
+
+  .tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 12px; }
+  .tile { position: relative; background: var(--bg-surface); border: 1px solid var(--border-soft); border-radius: var(--radius-md); padding: 12px 14px; overflow: hidden; }
+  .tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--c, var(--accent)); }
+  .tile .v { font-size: 23px; font-weight: 700; letter-spacing: -0.02em; }
+  .tile .l { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: var(--tr-label); color: var(--fg-tertiary); margin-top: 3px; }
+  .tile.g { --c: var(--success); } .tile.g .v { color: var(--success); }
+  .tile.b { --c: var(--info); } .tile.p { --c: var(--purple); } .tile.y { --c: var(--warning); }
+
+  .panel { background: var(--bg-surface); border: 1px solid var(--border-soft); border-radius: var(--radius-md); padding: 12px 14px; margin-bottom: 14px; }
+  .panel-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+  .panel-title { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: var(--tr-label); color: var(--fg-tertiary); }
+  .panel-meta { font-size: 11px; color: var(--fg-tertiary); }
+  .bars { display: flex; align-items: flex-end; gap: 3px; height: 70px; }
+  .bar-col { flex: 1; display: flex; align-items: flex-end; height: 100%; }
+  .bar { width: 100%; max-width: 22px; margin: 0 auto; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, var(--info), rgba(68,147,248,0.22)); }
+  .bar.now { background: linear-gradient(180deg, var(--success), rgba(63,185,80,0.2)); }
+
+  .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+  .search { flex: 1; padding: 8px 11px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-sunken); color: var(--fg-primary); font-size: 12px; }
+  .segmented { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .segmented button { background: transparent; border: none; padding: 7px 13px; font-size: 11.5px; color: var(--fg-tertiary); text-transform: capitalize; cursor: pointer; font-family: inherit; }
+  .segmented button.active { background: var(--bg-surface-2); color: var(--fg-primary); }
+
+  .table-wrap { border: 1px solid var(--border-soft); border-radius: var(--radius-md); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border-soft); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  th { font-size: 9.5px; text-transform: uppercase; letter-spacing: var(--tr-label); color: var(--fg-tertiary); font-weight: 600; background: var(--bg-sunken); }
+  tbody tr:hover { background: var(--bg-hover); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-secondary); font-family: var(--font-mono); font-size: 11.5px; }
+  .row-title { font-weight: 500; }
+  .row-sub { font-size: 10.5px; color: var(--fg-tertiary); }
+  .proj { color: var(--accent); }
+  .branch { color: var(--fg-secondary); font-family: var(--font-mono); font-size: 11px; }
+  .model-tag { font-size: 10px; padding: 1px 7px; border-radius: var(--radius-xs); background: var(--bg-surface-2); color: var(--fg-secondary); font-family: var(--font-mono); }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 550; padding: 2px 8px 2px 6px; border-radius: 999px; text-transform: capitalize; }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .pill.active { color: var(--success); background: var(--success-soft); } .pill.active .dot { background: var(--success); }
+  .pill.idle { color: var(--warning); background: var(--warning-soft); } .pill.idle .dot { background: var(--warning); }
+  .pill.closed { color: var(--fg-secondary); background: var(--bg-surface-2); } .pill.closed .dot { background: var(--fg-tertiary); }
+  .actions { text-align: right; }
+  .ico { background: transparent; border: 1px solid transparent; color: var(--fg-tertiary); border-radius: var(--radius-sm); padding: 3px 7px; font-size: 13px; cursor: pointer; }
+  .ico:hover { background: var(--bg-surface-2); color: var(--fg-primary); }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <div style="display:flex;align-items:center;">
+        <span class="brand-title">Claude Control Center</span>
+        <span class="live"><span class="pulse"></span>3 active</span>
+      </div>
+      <div class="brand-sub">local Claude Code sessions across all repos</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="tabs">
+      <button>24h</button><button class="active">7d</button><button>30d</button><button>all</button>
+    </div>
+    <div class="updated">updated 5:51:26 PM</div>
+    <button class="btn">⟳ Refresh</button>
+  </div>
+
+  <div class="tiles">
+    <div class="tile g"><div class="v">3</div><div class="l">Active now</div></div>
+    <div class="tile b"><div class="v">318</div><div class="l">Sessions</div></div>
+    <div class="tile p"><div class="v">50</div><div class="l">Projects</div></div>
+    <div class="tile b"><div class="v">8.1M</div><div class="l">Tokens</div></div>
+    <div class="tile y"><div class="v">$885</div><div class="l">Est. cost</div></div>
+    <div class="tile p"><div class="v">157</div><div class="l">PR links</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">Session activity</span><span class="panel-meta">last 24h</span></div>
+    <div class="bars">
+      <div class="bar-col"><div class="bar" style="height:20%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:38%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:55%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:30%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:72%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:90%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:48%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:62%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:80%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:40%"></div></div>
+      <div class="bar-col"><div class="bar" style="height:58%"></div></div>
+      <div class="bar-col"><div class="bar now" style="height:100%"></div></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <input class="search" placeholder="Search title, prompt, branch, repo, model, id…" />
+    <div class="segmented"><button class="active">all</button><button>active</button><button>idle</button><button>closed</button></div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Status</th><th>Session</th><th>Project</th><th>Branch</th><th>Model</th><th>Tokens ▼</th><th>Cost</th><th>Tools</th><th>Activity</th><th></th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="pill active"><span class="dot"></span>active</span></td>
+          <td><div class="row-title">Build Claude control center app</div><div class="row-sub">add notifications when agents finish work</div></td>
+          <td class="proj">session-control-center</td><td class="branch">main</td><td><span class="model-tag">opus</span></td>
+          <td class="num">15.4M</td><td class="num">$50.16</td><td class="num">52</td><td class="num">7s</td>
+          <td class="actions"><button class="ico">⧉</button><button class="ico">✦</button></td>
+        </tr>
+        <tr>
+          <td><span class="pill idle"><span class="dot"></span>idle</span></td>
+          <td><div class="row-title">Find cleaner graph library</div><div class="row-sub">evaluate d3 vs visx for the activity chart</div></td>
+          <td class="proj">web-dashboard</td><td class="branch">develop</td><td><span class="model-tag">opus</span></td>
+          <td class="num">158M</td><td class="num">$521</td><td class="num">267</td><td class="num">42m</td>
+          <td class="actions"><button class="ico">⧉</button><button class="ico">✦</button></td>
+        </tr>
+        <tr>
+          <td><span class="pill closed"><span class="dot"></span>closed</span></td>
+          <td><div class="row-title">Fix flaky integration test</div></td>
+          <td class="proj">api-server</td><td class="branch">main</td><td><span class="model-tag">opus</span></td>
+          <td class="num">71.5M</td><td class="num">$197</td><td class="num">114</td><td class="num">3h</td>
+          <td class="actions"><button class="ico">⧉</button><button class="ico">✦</button></td>
+        </tr>
+        <tr>
+          <td><span class="pill closed"><span class="dot"></span>closed</span></td>
+          <td><div class="row-title">Debug CI build failure</div></td>
+          <td class="proj">cli-tool</td><td class="branch">develop</td><td><span class="model-tag">sonnet</span></td>
+          <td class="num">46.8M</td><td class="num">$167</td><td class="num">91</td><td class="num">5h</td>
+          <td class="actions"><button class="ico">⧉</button><button class="ico">✦</button></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
