@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
       # pnpm 11 treats un-approved dependency build scripts as a fatal error.
       # esbuild bundles fine without them, so downgrade to a warning.
       PNPM_CONFIG_STRICT_DEP_BUILDS: "false"
@@ -47,3 +48,7 @@ jobs:
           # namespace must match the "publisher" in package.json; ignore "already exists"
           npx ovsx create-namespace valferon -p "$OVSX_PAT" || true
           npx ovsx publish *.vsix -p "$OVSX_PAT"
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ env.VSCE_PAT != '' }}
+        run: npx vsce publish --packagePath *.vsix -p "$VSCE_PAT"
