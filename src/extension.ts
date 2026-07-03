@@ -84,7 +84,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Periodic re-scan so time-based status flips (active -> idle) are detected
   // even when a session simply went quiet (no file event to wake us). Cheap:
   // re-stat + cached parse. Drives both the notifier and live status.
-  const tick = setInterval(() => void store.refresh(), 30_000);
+  // seen.sync() first: poll-merge other windows' seen shards in case the
+  // globalStorage watcher missed a write (out-of-workspace watchers are
+  // best-effort), so cross-window "reviewed" marks converge within a tick.
+  const tick = setInterval(() => {
+    void seen.sync();
+    void store.refresh();
+  }, 30_000);
   context.subscriptions.push({ dispose: () => clearInterval(tick) });
 
   // Poll Claude subscription usage infrequently (remote API, rate-limited;
@@ -146,8 +152,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         .getGroups()
         .flatMap((g) => g.sessions)
         .filter((s) => s.status === "pendingReview")
-        // Watermark = conversational activity, same clock as the overlay.
-        .map((s) => ({ sessionId: s.sessionId, atMs: lastActivityMs(s.aggregates, s.mtimeMs) }));
+        // "Reviewed as of now": wall clock, floored at the parsed watermark
+        // (same reasoning as openSession — the parse can lag the file, and
+        // marking at a stale watermark leaves the session pendingReview).
+        .map((s) => ({
+          sessionId: s.sessionId,
+          atMs: Math.max(lastActivityMs(s.aggregates, s.mtimeMs), Date.now()),
+        }));
       if (pending.length === 0) {
         void vscode.window.showInformationMessage("No sessions pending review.");
         return;
@@ -251,6 +262,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.onDidChangeWindowState((e) => {
       if (e.focused) {
         void consumePendingOpenSession(context);
+        // Catch up on marks made in other windows the instant you switch back,
+        // instead of waiting for the watcher (best-effort) or the 30s tick.
+        void seen.sync();
       }
     })
   );

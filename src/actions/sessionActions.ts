@@ -140,11 +140,19 @@ export async function openSession(
     void vscode.window.showWarningMessage("Session not found (it may have been removed).");
     return;
   }
-  // Opening = checking it: clear the "new since finished" mark at the current
-  // conversational watermark. NOT file mtime: non-conversational rewrites
-  // (ai-title regen, history snapshots) bump mtime and would flip an already
-  // reviewed session back to pendingReview.
-  void seen?.markSeen(session.sessionId, lastActivityMs(session.aggregates, session.mtimeMs));
+  // Opening = checking it: clear the "new since finished" mark at wall-clock
+  // NOW, not at this window's parsed watermark. The parsed watermark can lag
+  // the file (watcher latency, parse in flight), so marking at it left the
+  // session pendingReview after opening: the very next re-scan saw a newer
+  // conversational timestamp than the mark. "Reviewed as of the moment you
+  // opened it" is the honest semantics — records written before now count as
+  // seen, records written after correctly flip it back to pendingReview.
+  // Floor at the parsed watermark to stay monotonic if file timestamps ever
+  // run ahead of this machine's clock (session synced from elsewhere).
+  void seen?.markSeen(
+    session.sessionId,
+    Math.max(lastActivityMs(session.aggregates, session.mtimeMs), Date.now())
+  );
   const cwd = session.cwd;
   const forceNew = opts?.forceNewWindow ?? false;
   if (!forceNew && (!cwd || inCurrentWorkspace(cwd))) {

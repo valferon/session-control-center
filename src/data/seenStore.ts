@@ -49,6 +49,14 @@ export class SeenStore {
   // Load our own shard + merge every shard on disk, migrate one-time from the
   // old globalState location, then watch all shards for cross-window writes.
   async load(): Promise<void> {
+    // Ensure the watch base exists BEFORE creating the watcher: a watcher on a
+    // not-yet-existing directory never delivers events, so a window that hadn't
+    // written its own shard yet would never see other windows' marks.
+    try {
+      await vscode.workspace.fs.createDirectory(this.storageUri);
+    } catch {
+      // read-only storage: shards degrade to this window's memory only
+    }
     await this.mergeAllShards();
     // `own` starts EMPTY: this window persists only the marks it makes itself.
     // Seeding it from the union made every window rewrite the whole union into
@@ -88,17 +96,35 @@ export class SeenStore {
     this.watcher.onDidDelete(reload);
   }
 
-  // Re-merge every shard from disk and notify if the union changed.
+  // Re-merge every shard from disk and notify if the union grew. GROW-ONLY:
+  // disk entries are merged INTO the in-memory union, never replace it. A
+  // shard read mid-write (writeFile isn't atomic) parses as garbage and gets
+  // skipped; replacing the union would drop that shard's marks and flip
+  // reviewed sessions back to pendingReview until the next event. Monotonic
+  // merge makes a torn read a harmless no-op. (Stale-shard pruning still
+  // takes effect at next window load, which rebuilds from disk.)
   private async reloadFromDisk(): Promise<void> {
-    const before = this.merged;
-    const next = await this.readAllShards();
-    // Our own writes are already reflected in this.merged; skip the event when
-    // nothing actually changed so we don't churn listeners on our own writes.
-    if (mapsEqual(before, next)) {
-      return;
+    const disk = await this.readAllShards();
+    let changed = false;
+    for (const [id, m] of disk) {
+      if ((this.merged.get(id) ?? 0) < m) {
+        this.merged.set(id, m);
+        changed = true;
+      }
     }
-    this.merged = next;
-    this._onDidChange.fire();
+    // Skip the event when nothing actually grew so we don't churn listeners
+    // on our own writes (already reflected in this.merged).
+    if (changed) {
+      this._onDidChange.fire();
+    }
+  }
+
+  // Poll-merge fallback for cross-window sync. The FileSystemWatcher over
+  // globalStorage is best-effort (out-of-workspace watchers can silently miss
+  // events); callers invoke this on the periodic tick and on window focus so a
+  // missed event costs seconds, not a window reload.
+  async sync(): Promise<void> {
+    await this.reloadFromDisk();
   }
 
   // Have you opened this session at or after this conversational watermark
@@ -236,16 +262,4 @@ export class SeenStore {
 
 function isShard(name: string): boolean {
   return /^seen-.*\.json$/.test(name);
-}
-
-function mapsEqual(a: Map<string, number>, b: Map<string, number>): boolean {
-  if (a.size !== b.size) {
-    return false;
-  }
-  for (const [k, v] of a) {
-    if (b.get(k) !== v) {
-      return false;
-    }
-  }
-  return true;
 }
