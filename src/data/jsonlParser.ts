@@ -33,6 +33,10 @@ export async function parseSessionFile(
   const modelCounts = new Map<string, number>(); // distinct-message count per real model
   const filesTouched = new Set<string>();
   const seenUsageIds = new Set<string>(); // dedup multi-line messages sharing one usage object
+  // Maps an in-flight tool_use id to its tool name so the matching tool_result
+  // (a later user record) can attribute its payload size to the right tool.
+  // Entries are deleted once consumed, so the map stays small.
+  const pendingToolUse = new Map<string, string>();
   const prUrls = new Set<string>(); // dedup repeated pr-link records
   let title: string | undefined;
   let lastPrompt: string | undefined;
@@ -115,6 +119,10 @@ export async function parseSessionFile(
               agg.toolCalls++;
               const n = typeof c.name === "string" ? c.name : "unknown";
               agg.toolCallsByName[n] = (agg.toolCallsByName[n] ?? 0) + 1;
+              agg.toolCharsByName[n] = (agg.toolCharsByName[n] ?? 0) + jsonChars(c.input);
+              if (typeof c.id === "string" && c.id) {
+                pendingToolUse.set(c.id, n);
+              }
               if (INPUT_PROMPT_TOOLS.has(n)) {
                 blockedOnUser = true;
               }
@@ -140,6 +148,21 @@ export async function parseSessionFile(
       // and the interrupt marker isn't a prompt either.
       if (!interrupt && isRealPrompt(rec.message)) {
         agg.turns++;
+      }
+      // tool_result echoes carry the tool's output back into context — that
+      // payload is what actually costs input tokens. Attribute its size to the
+      // tool that produced it via the pending tool_use id.
+      const uc = rec.message?.content;
+      if (Array.isArray(uc)) {
+        for (const c of uc) {
+          if (c && c.type === "tool_result" && typeof c.tool_use_id === "string") {
+            const name = pendingToolUse.get(c.tool_use_id);
+            if (name) {
+              pendingToolUse.delete(c.tool_use_id);
+              agg.toolCharsByName[name] = (agg.toolCharsByName[name] ?? 0) + jsonChars(c.content);
+            }
+          }
+        }
       }
       collectContext(rec, cwdCounts, (b) => (gitBranch = b ?? gitBranch), (v) => (version = v ?? version));
     } else if (type === "attachment") {
@@ -429,4 +452,32 @@ function mostFrequent(counts: Map<string, number>): string | undefined {
 
 function num(v: unknown): number {
   return typeof v === "number" && isFinite(v) ? v : 0;
+}
+
+// Size of a tool payload in characters. Strings are taken as-is; anything else
+// (input objects, tool_result block arrays) is measured as serialized JSON,
+// skipping base64 image blocks so a screenshot doesn't dwarf every text tool
+// (image tokens don't scale with base64 length anyway).
+function jsonChars(v: unknown): number {
+  if (v === undefined || v === null) {
+    return 0;
+  }
+  if (typeof v === "string") {
+    return v.length;
+  }
+  if (Array.isArray(v)) {
+    let total = 0;
+    for (const b of v) {
+      if (b && typeof b === "object" && (b as any).type === "image") {
+        continue;
+      }
+      total += jsonChars(typeof (b as any)?.text === "string" ? (b as any).text : b);
+    }
+    return total;
+  }
+  try {
+    return JSON.stringify(v)?.length ?? 0;
+  } catch {
+    return 0;
+  }
 }

@@ -48,6 +48,12 @@ export interface Aggregates {
   assistantTurns: number;
   toolCalls: number;
   toolCallsByName: Record<string, number>;
+  // Approximate payload volume per tool: JSON chars of the tool_use input plus
+  // the tool_result content, keyed by tool name. chars/4 ≈ tokens. This is an
+  // ESTIMATE of what each tool (incl. MCP tools, named mcp__server__tool)
+  // contributes to context — exact per-tool tokens don't exist in the jsonl
+  // (the API reports usage per message, not per tool).
+  toolCharsByName: Record<string, number>;
   tokens: TokenUsage;
   models: string[];
   startedAt?: string;
@@ -75,6 +81,7 @@ export function emptyAggregates(): Aggregates {
     assistantTurns: 0,
     toolCalls: 0,
     toolCallsByName: {},
+    toolCharsByName: {},
     tokens: emptyTokens(),
     models: [],
     queueDepth: 0,

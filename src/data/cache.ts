@@ -8,7 +8,7 @@ interface CacheEntry {
 }
 
 interface CacheFile {
-  version: 4;
+  version: 5;
   entries: Record<string, CacheEntry>; // key = filePath
 }
 
@@ -18,7 +18,9 @@ const CACHE_NAME = "session-cache.json";
 //     discard v2 entries so cwd/grouping is recomputed.
 // v4: aggregates gained `queueDepth` (and lastTs counts system/queue records);
 //     discard v3 entries so status inputs are re-derived.
-const CACHE_VERSION = 4 as const;
+// v5: aggregates gained `toolCharsByName` (per-tool payload sizes for the
+//     tool/MCP usage panel); discard v4 entries so they get populated.
+const CACHE_VERSION = 5 as const;
 
 // Persisted per-session aggregate cache, keyed by file path + (mtime,size).
 // Lives in globalStorageUri so it survives reloads and is trivially nukable.

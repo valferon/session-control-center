@@ -169,6 +169,7 @@ function render(): void {
     usageStrip(),
     tiles(m),
     topProjectsPanel(),
+    toolUsagePanel(),
     controls(rows.length),
     tableWrap(rows)
   );
@@ -366,6 +367,87 @@ function topProjectsPanel(): HTMLElement {
   }
   panel.append(list);
   return panel;
+}
+
+// Tool & MCP usage within the selected range. MCP tools (mcp__server__tool)
+// are grouped per server so you can see how much context each MCP eats.
+// Token numbers are ESTIMATES from payload size (chars/4): the jsonl only has
+// per-message usage, never per-tool, and MCP tool-definition overhead in the
+// system prompt is invisible here.
+function toolUsagePanel(): HTMLElement {
+  const panel = el("div", "panel");
+  const head = el("div", "panel-head");
+  const t = el("div", "panel-title");
+  t.textContent = "Tool & MCP usage";
+  const meta = el("div", "panel-meta");
+  meta.textContent = `${rangeLabel()} · est. tokens from payload size`;
+  head.append(t, meta);
+  panel.append(head);
+
+  const cutoff = Date.now() - RANGE_MS[state.range];
+  const agg = new Map<string, { calls: number; chars: number; mcp: boolean }>();
+  for (const { s } of allRows()) {
+    if (activityMs(s) < cutoff) continue;
+    const calls = s.aggregates.toolCallsByName ?? {};
+    const chars = s.aggregates.toolCharsByName ?? {};
+    for (const name of new Set([...Object.keys(calls), ...Object.keys(chars)])) {
+      const { key, mcp } = toolGroup(name);
+      let e = agg.get(key);
+      if (!e) {
+        e = { calls: 0, chars: 0, mcp };
+        agg.set(key, e);
+      }
+      e.calls += calls[name] ?? 0;
+      e.chars += chars[name] ?? 0;
+    }
+  }
+  const rows = [...agg.entries()]
+    .map(([name, e]) => ({ name, ...e, tokens: Math.round(e.chars / 4) }))
+    .sort((a, b) => b.tokens - a.tokens)
+    .slice(0, 12);
+
+  if (rows.length === 0) {
+    const empty = el("div", "panel-empty");
+    empty.textContent = "No tool activity in this range.";
+    panel.append(empty);
+    return panel;
+  }
+
+  const totalTok = Math.max(1, [...agg.values()].reduce((n, e) => n + e.chars, 0) / 4);
+  const max = Math.max(1, ...rows.map((r) => r.tokens));
+  const list = el("div", "hbars");
+  for (const r of rows) {
+    const row = el("div", "hbar-row");
+    const name = el("div", "hbar-name");
+    name.textContent = r.name;
+    name.title = r.name;
+    if (r.mcp) {
+      const tag = el("span", "model-tag");
+      tag.textContent = "mcp";
+      name.append(tag);
+    }
+    const track = el("div", "hbar-track");
+    const fill = el("div", "hbar-fill" + (r.mcp ? " mcp" : ""));
+    fill.style.width = Math.max(3, Math.round((r.tokens / max) * 100)) + "%";
+    track.append(fill);
+    const val = el("div", "hbar-val");
+    const share = Math.round((r.tokens / totalTok) * 100);
+    val.textContent = `~${fmtNum(r.tokens)} tok · ${fmtNum(r.calls)} calls · ${share}%`;
+    row.append(name, track, val);
+    list.append(row);
+  }
+  panel.append(list);
+  return panel;
+}
+
+// mcp__linear__create_issue → { key: "linear (MCP)", mcp: true };
+// built-ins keep their own name so heavy ones (Read, Bash) stay visible.
+function toolGroup(name: string): { key: string; mcp: boolean } {
+  const m = /^mcp__(.+?)__/.exec(name);
+  if (m) {
+    return { key: m[1], mcp: true };
+  }
+  return { key: name, mcp: false };
 }
 
 function rangeLabel(): string {
