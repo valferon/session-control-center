@@ -44,11 +44,20 @@ export class SessionNode extends vscode.TreeItem {
   constructor(
     public readonly session: Session,
     public readonly archived = false,
-    iconsBase?: vscode.Uri
+    iconsBase?: vscode.Uri,
+    revision = 0
   ) {
     super(SessionNode.label(session), vscode.TreeItemCollapsibleState.None);
     const s = session;
-    this.id = s.filePath;
+    // Salted with the provider's refresh revision ON PURPOSE: the native tree
+    // restores selection/focus by id across refreshes, so a stable id kept the
+    // last-clicked session row grey-highlighted indefinitely — it read as a
+    // stale "current session" marker. A fresh id every refresh means no
+    // session row ever stays highlighted: clicking a row opens it, the open
+    // marks it seen, and the resulting refresh sheds the selection right away.
+    // Session rows are leaves (no collapse state) and are never reveal()ed by
+    // id, so nothing else keys off id stability.
+    this.id = `${s.filePath}@${revision}`;
     this.description = (archived ? "archived · " : "") + SessionNode.describe(s);
     // Suffix order matters: the `archived` token drives the archive/unarchive
     // menu split via regex in package.json. Keep "session" as the prefix so the
@@ -194,6 +203,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   private hideIdle = true;
   private showArchived = false;
   private view?: vscode.TreeView<TreeNode>;
+  // Bumped every refresh; salts session row ids so selection never survives a
+  // refresh (see SessionNode id comment).
+  private revision = 0;
   // Tints this window's own repo row (instead of hijacking selection).
   readonly decorations = new WindowRepoDecorations();
 
@@ -290,7 +302,12 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         .filter((s) => this.matches(s))
         .map(
           (s) =>
-            new SessionNode(s, this.archive.isArchived(s.sessionId), this.extensionUri)
+            new SessionNode(
+              s,
+              this.archive.isArchived(s.sessionId),
+              this.extensionUri,
+              this.revision
+            )
         );
     }
     return [];
@@ -394,6 +411,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   }
 
   private fire(): void {
+    this.revision++;
     this.updateMessage();
     this._onDidChangeTreeData.fire();
     // Recompute which project row is this window's repo; no-ops if unchanged.
