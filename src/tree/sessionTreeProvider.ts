@@ -1,17 +1,19 @@
 import * as vscode from "vscode";
 import { ProjectGroup, Session, SessionStatus, UsageWindow } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
-import { lastActivityMs } from "../data/jsonlParser";
 import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
 import { SeenStore } from "../data/seenStore";
 import { readModelSettings } from "../data/paths";
-import { CurrentSessionDecorations, sessionUri } from "./sessionDecorations";
+import { projectUri, WindowRepoDecorations } from "./sessionDecorations";
 
 export class ProjectNode extends vscode.TreeItem {
   constructor(public readonly group: ProjectGroup) {
     super(group.label, vscode.TreeItemCollapsibleState.Expanded);
     this.id = "proj:" + group.key; // stable id so TreeView.reveal can match
+    // Tag for the FileDecorationProvider so this window can tint its own
+    // repo's row (custom scheme — not a real file, never opened).
+    this.resourceUri = projectUri(group.key);
     const parts = [`${group.sessions.length} sessions`];
     if (group.activeCount > 0) {
       parts.push(`${group.activeCount} active`);
@@ -47,9 +49,6 @@ export class SessionNode extends vscode.TreeItem {
     super(SessionNode.label(session), vscode.TreeItemCollapsibleState.None);
     const s = session;
     this.id = s.filePath;
-    // Tag for the FileDecorationProvider so this window can tint its own repo's
-    // session row (custom scheme — not a real file, never opened).
-    this.resourceUri = sessionUri(s.sessionId);
     this.description = (archived ? "archived · " : "") + SessionNode.describe(s);
     // Suffix order matters: the `archived` token drives the archive/unarchive
     // menu split via regex in package.json. Keep "session" as the prefix so the
@@ -195,8 +194,8 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   private hideIdle = true;
   private showArchived = false;
   private view?: vscode.TreeView<TreeNode>;
-  // Tints this window's own repo session row (instead of hijacking selection).
-  readonly decorations = new CurrentSessionDecorations();
+  // Tints this window's own repo row (instead of hijacking selection).
+  readonly decorations = new WindowRepoDecorations();
 
   constructor(
     private readonly store: SessionStore,
@@ -217,7 +216,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   attachView(view: vscode.TreeView<TreeNode>): void {
     this.view = view;
     this.updateMessage();
-    this.decorations.setCurrent(this.currentSessionId());
+    this.decorations.setCurrent(this.currentGroupKeys());
   }
 
   refresh(): void {
@@ -297,57 +296,29 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     return [];
   }
 
-  // The session open in THIS window: among sessions whose cwd relates to a
-  // current workspace folder, prefer LIVE (active/awaiting) over done
-  // (finished/pendingReview/interrupted) over stale (idle), then most recent
-  // REAL activity. Match by containment (either direction): a session's cwd is
-  // the repo root while a workspace folder may be a subdir of it (or
-  // vice-versa), so exact equality misses the common case and nothing gets
-  // highlighted.
+  // The project group(s) whose repo is open in THIS window. Match by
+  // containment (either direction): a group's cwd is the repo root while a
+  // workspace folder may be a subdir of it (or vice-versa), so exact equality
+  // misses the common case and nothing gets highlighted. A multi-root window
+  // matches every folder's group.
   //
-  // Two traps this ranking exists to avoid:
-  // - A live session mid-tool-call writes nothing for minutes; if done
-  //   sessions ranked equal, any session that finished meanwhile would steal
-  //   the highlight on raw recency.
-  // - Tie-break uses lastActivityMs (conversation time), NOT file mtime:
-  //   non-conversational rewrites (ai-title regen, snapshots) bump mtime and
-  //   would let a stale session win.
-  // Interrupted ranks with "done", not zero: an ESC'd session is usually
-  // exactly the one open in this window, and its interrupt marker is
-  // timestamped so recency carries it.
-  private currentSessionId(): string | undefined {
+  // Deliberately repo-level, not session-level: which SESSION is open in this
+  // window is a guess (nothing in the jsonl says which tab a window shows, so
+  // a ranking heuristic jumped between rows as statuses flipped). Which repo
+  // this window has open is a fact — workspace folders — so the highlight is
+  // deterministic and never moves on its own.
+  private currentGroupKeys(): Set<string> {
+    const keys = new Set<string>();
     const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => normPath(f.uri.fsPath));
     if (folders.length === 0) {
-      return undefined;
+      return keys;
     }
-    let best: Session | undefined;
-    let bestRank = -1;
-    let bestActivity = -1;
     for (const g of this.store.getGroups()) {
-      for (const s of g.sessions) {
-        if (!s.cwd || !folders.some((f) => pathRelated(normPath(s.cwd!), f))) {
-          continue;
-        }
-        // Archived = explicitly buried; never "the current session" (and its
-        // row is usually hidden, which would make the highlight vanish).
-        if (this.archive.isArchived(s.sessionId)) {
-          continue;
-        }
-        const rank =
-          s.status === "active" || s.status === "awaiting"
-            ? 2
-            : s.status === "idle"
-              ? 0
-              : 1;
-        const activity = lastActivityMs(s.aggregates, s.mtimeMs);
-        if (rank > bestRank || (rank === bestRank && activity > bestActivity)) {
-          best = s;
-          bestRank = rank;
-          bestActivity = activity;
-        }
+      if (g.cwd && folders.some((f) => pathRelated(normPath(g.cwd!), f))) {
+        keys.add(g.key);
       }
     }
-    return best?.sessionId;
+    return keys;
   }
 
   private usageStats(): StatNode[] {
@@ -425,8 +396,8 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   private fire(): void {
     this.updateMessage();
     this._onDidChangeTreeData.fire();
-    // Recompute which row is this window's repo session; no-ops if unchanged.
-    this.decorations.setCurrent(this.currentSessionId());
+    // Recompute which project row is this window's repo; no-ops if unchanged.
+    this.decorations.setCurrent(this.currentGroupKeys());
   }
 
   private updateMessage(): void {
