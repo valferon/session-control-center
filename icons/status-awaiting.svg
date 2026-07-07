@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Blue dot with exploding rings (radar ping): "blocked on your input".
+       Rings start at opacity 0 so nothing shows before their staggered begin. -->
+  <circle cx="8" cy="8" r="2.6" fill="#3794ff"/>
+  <circle cx="8" cy="8" r="2.6" fill="none" stroke="#3794ff" stroke-width="1.4" opacity="0">
+    <animate attributeName="r" values="2.6;7.2" dur="1.1s" begin="0s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.9;0" dur="1.1s" begin="0s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="8" cy="8" r="2.6" fill="none" stroke="#3794ff" stroke-width="1.4" opacity="0">
+    <animate attributeName="r" values="2.6;7.2" dur="1.1s" begin="0.55s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.9;0" dur="1.1s" begin="0.55s" repeatCount="indefinite"/>
+  </circle>
+</svg>

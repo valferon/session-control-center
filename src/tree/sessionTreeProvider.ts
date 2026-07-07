@@ -99,17 +99,33 @@ export class SessionNode extends vscode.TreeItem {
     return bits.join(" · ");
   }
 
-  private static icon(status: SessionStatus, _iconsBase?: vscode.Uri): vscode.ThemeIcon {
-    // The native tree only animates codicons via the `~spin` (rotation)
-    // modifier — SVG-file icons render static, so they can't pulse/slide. The
-    // live states therefore use spinning codicons so they visibly move and
-    // catch the eye; the quiet states stay plain colored dots.
-    //   active       = green spinner (working)
-    //   awaiting     = blue ringing bell (blocked on your input)
-    //   pendingReview = bright amber filled check (done, but you haven't
-    //                  checked it since it last changed — your move)
+  private static icon(
+    status: SessionStatus,
+    iconsBase?: vscode.Uri
+  ): vscode.ThemeIcon | vscode.Uri {
+    // Attention states use SVG-file icons with SMIL (<animate>) animations —
+    // Chromium runs SMIL even for images used as CSS backgrounds, which is how
+    // the tree renders file icons, so these genuinely move (codicons only
+    // offer `~spin` rotation, which reads as noise at 16px). Quiet states stay
+    // plain themed codicons.
+    //   active       = green dot sweeping left<->right (working)
+    //   awaiting     = exploding blue dot / radar ping (blocked on your input)
+    //   pendingReview = pulsing orange dot (done, but you haven't checked it
+    //                  since it last changed — your move)
     //   finished     = dim outline check (done AND reviewed)
     //   idle         = faint grey dot (stale: quiet > idle window)
+    if (iconsBase) {
+      if (status === "active") {
+        return vscode.Uri.joinPath(iconsBase, "icons", "status-active.svg");
+      }
+      if (status === "awaiting") {
+        return vscode.Uri.joinPath(iconsBase, "icons", "status-awaiting.svg");
+      }
+      if (status === "pendingReview") {
+        return vscode.Uri.joinPath(iconsBase, "icons", "status-review.svg");
+      }
+    }
+    // Codicon fallbacks (also used if no extensionUri was provided).
     if (status === "active") {
       return new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.green"));
     }
@@ -117,8 +133,6 @@ export class SessionNode extends vscode.TreeItem {
       return new vscode.ThemeIcon("bell~spin", new vscode.ThemeColor("charts.blue"));
     }
     if (status === "pendingReview") {
-      // Bright filled check in a warm colour — completed but unreviewed, demands
-      // a look. Distinct hue from finished so "new" vs "checked" reads at a glance.
       return new vscode.ThemeIcon("pass-filled", new vscode.ThemeColor("charts.yellow"));
     }
     if (status === "finished") {

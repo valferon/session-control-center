@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Pulsing orange dot: "done, needs your review". -->
+  <circle cx="8" cy="8" r="4" fill="#e8912d">
+    <animate attributeName="r" values="2.8;4.8;2.8" keyTimes="0;0.5;1" dur="1.3s"
+      calcMode="spline" keySplines="0.45 0 0.55 1;0.45 0 0.55 1" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.55;1;0.55" keyTimes="0;0.5;1" dur="1.3s" repeatCount="indefinite"/>
+  </circle>
+</svg>

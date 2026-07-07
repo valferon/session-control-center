@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Green dot sweeping left<->right along a faint track: "working". -->
+  <line x1="2.5" y1="8" x2="13.5" y2="8" stroke="#3fb950" stroke-opacity="0.3" stroke-width="2" stroke-linecap="round"/>
+  <circle cy="8" r="3" fill="#3fb950">
+    <animate attributeName="cx" values="4;12;4" keyTimes="0;0.5;1" dur="1.2s"
+      calcMode="spline" keySplines="0.45 0 0.55 1;0.45 0 0.55 1" repeatCount="indefinite"/>
+  </circle>
+</svg>
