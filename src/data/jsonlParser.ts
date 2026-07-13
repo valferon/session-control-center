@@ -104,6 +104,8 @@ export async function parseSessionFile(
           // Skip the placeholder "<synthetic>" model (zero-usage, never selected).
           if (typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
             modelCounts.set(msg.model, (modelCounts.get(msg.model) ?? 0) + 1);
+            // Last-write-wins: the session's CURRENT model (tracks /model switches).
+            agg.lastModel = msg.model;
           }
         }
         // tool_use blocks ARE genuinely one-per-line — count every line.

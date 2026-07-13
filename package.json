@@ -139,6 +139,11 @@
         "command": "claudeControlCenter.showLogs",
         "title": "Claude Control Center: Show Logs",
         "icon": "$(output)"
+      },
+      {
+        "command": "claudeControlCenter.setModel",
+        "title": "Claude Control Center: Set Default Model",
+        "icon": "$(chip)"
       }
     ],
     "menus": {

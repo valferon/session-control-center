@@ -74,6 +74,47 @@ export function readModelSettings(projectDir?: string): { model?: string; effort
   return { model, effort };
 }
 
+// Where a model change can be written. "global" = ~/.claude/settings.json
+// (every project); "projectLocal" = <repo>/.claude/settings.local.json (this
+// repo only, git-ignored by convention — never touches the shared
+// .claude/settings.json that may be committed).
+export type ModelScope = "global" | "projectLocal";
+
+export function modelSettingsFile(scope: ModelScope, projectDir?: string): string | undefined {
+  if (scope === "global") {
+    return path.join(resolveClaudeHome(), "settings.json");
+  }
+  return projectDir ? path.join(projectDir, ".claude", "settings.local.json") : undefined;
+}
+
+// Set (or clear, with undefined) the `model` key in a Claude settings file,
+// preserving every other key. Creates the file/dir when missing. Throws on a
+// file that exists but isn't valid JSON — better to fail loudly than clobber
+// a hand-edited settings file we couldn't parse.
+export function writeModelSetting(file: string, model: string | undefined): void {
+  let settings: Record<string, unknown> = {};
+  let raw: string | undefined;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    // missing file: start from empty settings
+  }
+  if (raw !== undefined) {
+    const parsed = JSON.parse(raw); // throws on corrupt JSON — caller surfaces it
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${file} is not a JSON object`);
+    }
+    settings = parsed as Record<string, unknown>;
+  }
+  if (model === undefined) {
+    delete settings.model;
+  } else {
+    settings.model = model;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n", "utf8");
+}
+
 // Heuristic decode of an encoded dir name into a path. UNRELIABLE because repo
 // names containing dashes are ambiguous; only used as a fallback label/path
 // when no cwd was found inside the session log.

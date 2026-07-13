@@ -5,6 +5,7 @@ import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
 import { SeenStore } from "../data/seenStore";
 import { readModelSettings } from "../data/paths";
+import { findActiveClaudeSession } from "../util/activeClaudeTab";
 import { projectUri, WindowRepoDecorations } from "./sessionDecorations";
 
 export class ProjectNode extends vscode.TreeItem {
@@ -91,8 +92,9 @@ export class SessionNode extends vscode.TreeItem {
       bits.push(s.gitBranch);
     }
     // Per-session model, so it's clear the usage panel's "default model" stat
-    // is a window default, not what every session runs on.
-    const model = shortModel(s.aggregates.models);
+    // is a window default, not what every session runs on. lastModel first:
+    // it tracks a mid-session /model switch; models[0] is most-used and lags.
+    const model = shortModel(s.aggregates.lastModel ? [s.aggregates.lastModel] : s.aggregates.models);
     if (model) {
       bits.push(model);
     }
@@ -168,9 +170,10 @@ export class SessionNode extends vscode.TreeItem {
     if (s.gitBranch) {
       md.appendMarkdown(`Branch: \`${s.gitBranch}\`\n\n`);
     }
-    md.appendMarkdown(
-      `Model: ${a.models.join(", ") || "?"} · Turns: ${a.turns} · Tools: ${a.toolCalls}\n\n`
-    );
+    const modelLine = a.lastModel
+      ? a.lastModel + (a.models.length > 1 ? ` (earlier: ${a.models.filter((m) => m !== a.lastModel).join(", ")})` : "")
+      : a.models.join(", ") || "?";
+    md.appendMarkdown(`Model: ${modelLine} · Turns: ${a.turns} · Tools: ${a.toolCalls}\n\n`);
     md.appendMarkdown(`Tokens: ${fmtNum(total)} · ~$${s.costUsd.toFixed(2)}\n\n`);
     if (a.filesTouched > 0) {
       md.appendMarkdown(`Files touched: ${a.filesTouched}\n\n`);
@@ -196,13 +199,14 @@ export class UsageNode extends vscode.TreeItem {
 }
 
 export class StatNode extends vscode.TreeItem {
-  constructor(label: string, value: string, icon: string, color?: string) {
+  constructor(label: string, value: string, icon: string, color?: string, command?: vscode.Command) {
     super(value, vscode.TreeItemCollapsibleState.None);
     this.description = label;
     this.contextValue = "stat";
     this.iconPath = color
       ? new vscode.ThemeIcon(icon, new vscode.ThemeColor(color))
       : new vscode.ThemeIcon(icon);
+    this.command = command;
   }
 }
 
@@ -392,6 +396,24 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     }
     }
 
+    // Model of the session you're LOOKING AT (focused Claude tab), when one can
+    // be identified — this row follows tab focus, so it always describes the
+    // conversation on screen. lastModel = model of the newest assistant message,
+    // so a mid-session /model switch shows up immediately.
+    const setModelCmd: vscode.Command = {
+      command: "claudeControlCenter.setModel",
+      title: "Set Claude Model",
+    };
+    const active = findActiveClaudeSession(this.store);
+    const activeModel = active && (active.aggregates.lastModel ?? active.aggregates.models[0]);
+    if (active && activeModel) {
+      const n = new StatNode("model (focused session)", shortModel([activeModel]), "chip", "charts.green", setModelCmd);
+      n.tooltip =
+        `Model of the focused Claude tab ("${active.title ?? active.sessionId.slice(0, 8)}"): ${activeModel}. ` +
+        "Change a RUNNING session's model with /model inside it; click to change the default for new conversations.";
+      nodes.push(n);
+    }
+
     // Currently selected model + reasoning effort (from settings.json). This is
     // the WINDOW's default for new conversations — NOT per-session; each session
     // row shows its own model in its description/tooltip. There is no API to
@@ -399,10 +421,14 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     // /model inside the conversation.
     const sel = readModelSettings(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
     if (sel.model) {
-      const n = new StatNode("default model (this window)", sel.model, "chip", "charts.blue");
+      const n = new StatNode("default model (new sessions)", sel.model, "chip", "charts.blue", setModelCmd);
       n.tooltip =
         "Model selected in Claude settings.json — the default for NEW conversations in this window. " +
-        "Per-session models are shown on each session row. Change a running session's model with /model inside it.";
+        "Click to change it. Per-session models are shown on each session row; change a running session's model with /model inside it.";
+      nodes.push(n);
+    } else {
+      const n = new StatNode("default model (new sessions)", "auto", "chip", undefined, setModelCmd);
+      n.tooltip = "No model pinned in Claude settings.json (Claude Code picks). Click to pin one.";
       nodes.push(n);
     }
     if (sel.effort) {

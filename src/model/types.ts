@@ -56,6 +56,10 @@ export interface Aggregates {
   toolCharsByName: Record<string, number>;
   tokens: TokenUsage;
   models: string[];
+  // Model of the MOST RECENT assistant message — the session's current model.
+  // models[] is most-used-first (drives cost rate) and goes stale after a
+  // mid-session /model switch until the new model dominates; this doesn't.
+  lastModel?: string;
   startedAt?: string;
   endedAt?: string;
   filesTouched: number;

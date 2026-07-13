@@ -18,6 +18,8 @@ import {
 import { SessionNotifier } from "./notifications/notifier";
 import { UsageService } from "./data/usageService";
 import { lastActivityMs } from "./data/jsonlParser";
+import { modelSettingsFile, readModelSettings, writeModelSetting } from "./data/paths";
+import { activeTabKey } from "./util/activeClaudeTab";
 import { initLog, log } from "./util/log";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -97,6 +99,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // multiple windows compound, so keep this gentle). Backoff handles 429s.
   const usageTick = setInterval(() => void usage.refresh(), 300_000);
   context.subscriptions.push({ dispose: () => clearInterval(usageTick) });
+
+  // The "model (focused session)" stat in the tree follows the focused editor
+  // tab; refresh the tree when the active tab changes so it tracks what you're
+  // actually looking at. Keyed so tab events that don't move focus (e.g. a
+  // background tab closing) don't trigger pointless re-renders.
+  let lastTabKey = activeTabKey();
+  const onTabsChanged = () => {
+    const key = activeTabKey();
+    if (key !== lastTabKey) {
+      lastTabKey = key;
+      treeProvider.refresh();
+    }
+  };
+  context.subscriptions.push(
+    vscode.window.tabGroups.onDidChangeTabs(onTabsChanged),
+    vscode.window.tabGroups.onDidChangeTabGroups(onTabsChanged)
+  );
 
   // Resolve a session reference from a tree node or raw arg. A tree node
   // yields the exact Session object (unambiguous even when the same session id
@@ -234,6 +253,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showInformationMessage(`Copied session id ${id}`);
       }
     }),
+    vscode.commands.registerCommand("claudeControlCenter.setModel", async () => {
+      await setModel(treeProvider);
+    }),
     vscode.commands.registerCommand("claudeControlCenter.deleteSession", (arg) => {
       // Exact Session from the clicked row — a duplicated conversation must
       // delete the copy the user pointed at, not whichever id lookup finds.
@@ -267,6 +289,84 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void seen.sync();
       }
     })
+  );
+}
+
+// Change the default model for NEW Claude conversations by writing the `model`
+// key into Claude's own settings.json (global) or the repo's
+// .claude/settings.local.json. Cannot retarget an already-running session —
+// only /model inside the conversation can do that — so say so.
+async function setModel(treeProvider: SessionTreeProvider): Promise<void> {
+  const projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const current = readModelSettings(projectDir).model;
+
+  const CUSTOM = "Custom model id…";
+  const CLEAR = "Clear (let Claude Code pick)";
+  const pick = await vscode.window.showQuickPick(
+    [
+      { label: "opus", description: "highest capability" },
+      { label: "sonnet", description: "balanced (default)" },
+      { label: "haiku", description: "fastest / cheapest" },
+      { label: CUSTOM, description: "full id, e.g. claude-sonnet-5" },
+      { label: CLEAR },
+    ],
+    { placeHolder: `Default model for new conversations${current ? ` (currently: ${current})` : ""}` }
+  );
+  if (!pick) {
+    return;
+  }
+  let model: string | undefined;
+  if (pick.label === CLEAR) {
+    model = undefined;
+  } else if (pick.label === CUSTOM) {
+    const typed = await vscode.window.showInputBox({
+      prompt: "Model id or alias to write into Claude settings",
+      placeHolder: "claude-sonnet-5, claude-opus-4-8, …",
+      value: current ?? "",
+    });
+    if (typed === undefined || !typed.trim()) {
+      return;
+    }
+    model = typed.trim();
+  } else {
+    model = pick.label;
+  }
+
+  const scopeItems: Array<{ label: string; description: string; scope: "global" | "projectLocal" }> = [
+    { label: "Globally", description: "~/.claude/settings.json — every project", scope: "global" },
+  ];
+  if (projectDir) {
+    scopeItems.push({
+      label: "This project",
+      description: ".claude/settings.local.json — this repo only",
+      scope: "projectLocal",
+    });
+  }
+  const scopePick =
+    scopeItems.length === 1
+      ? scopeItems[0]
+      : await vscode.window.showQuickPick(scopeItems, { placeHolder: "Where should this apply?" });
+  if (!scopePick) {
+    return;
+  }
+  const file = modelSettingsFile(scopePick.scope, projectDir);
+  if (!file) {
+    return;
+  }
+  try {
+    writeModelSetting(file, model);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`setModel failed: ${msg}`);
+    void vscode.window.showErrorMessage(`Couldn't update ${file}: ${msg}`);
+    return;
+  }
+  log(`setModel: model=${model ?? "(cleared)"} scope=${scopePick.scope} file=${file}`);
+  treeProvider.refresh();
+  void vscode.window.showInformationMessage(
+    model
+      ? `Default model set to "${model}" for new conversations. Running sessions keep theirs — use /model inside a session to switch it.`
+      : "Model cleared — Claude Code will pick the default for new conversations."
   );
 }
 

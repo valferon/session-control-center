@@ -595,7 +595,9 @@ function sessionRow(s: Session, project: ProjectGroup): HTMLElement {
   tr.append(cellHtml((td) => { td.className = "proj"; td.textContent = project.label; }));
   tr.append(cellHtml((td) => { td.className = "branch"; td.textContent = s.gitBranch || "—"; }));
   tr.append(cellHtml((td) => {
-    const m = shortModel(s.aggregates.models);
+    // lastModel first: current model of the session (tracks /model switches);
+    // models[] is most-used-first and lags after a switch.
+    const m = shortModel(s.aggregates.lastModel ? [s.aggregates.lastModel] : s.aggregates.models);
     if (m === "—") { td.textContent = "—"; return; }
     const tag = el("span", "model-tag");
     tag.textContent = m;
