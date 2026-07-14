@@ -7,7 +7,7 @@ import {
   Session,
   SessionStatus,
 } from "../model/types";
-import { computeStatus, lastActivityMs, parseSessionFile, StatusThresholds } from "./jsonlParser";
+import { computeStatus, lastActivityMs, parseSessionFile, SessionParser, StatusThresholds } from "./jsonlParser";
 import { decodeEncodedDir, resolveProjectsDir } from "./paths";
 import { SessionCache } from "./cache";
 import { SeenStore } from "./seenStore";
@@ -24,10 +24,32 @@ export interface StoreConfig {
 // finished session settles by the next periodic re-scan.
 const HOT_FILE_GRACE_MS = 10_000;
 
+// How many recently-appended files keep a live incremental parser in memory.
+// Only actively-written sessions benefit (the watcher fires on them every few
+// seconds); parsers for files that went quiet are evicted LRU. Each parser
+// retains per-session dedup sets that grow with the session's length (roughly
+// one small entry per assistant message — a few hundred KB for a 10MB session),
+// so the cap bounds the parser COUNT; per-parser size is bounded by the size
+// of the session itself.
+const HOT_PARSER_MAX = 16;
+
+// Cold-scan parse parallelism. Parsing is stream-I/O bound; a small pool keeps
+// the disk busy without starving the extension host event loop.
+const SCAN_PARSE_CONCURRENCY = 8;
+
 // Owns the in-memory session index, drives (cached) parsing, and exposes the
 // grouped/aggregated view plus a change event for the UI.
 export class SessionStore {
   private sessions = new Map<string, Session>(); // key = filePath
+  // Live incremental parsers for hot (actively appended) files, LRU by last use.
+  // Lets refreshFile parse only the appended tail instead of re-streaming the
+  // whole multi-MB file on every watcher event. mtimeMs is the file mtime at
+  // the last successful feed — a later stat with an OLDER mtime means the file
+  // was replaced (e.g. restored from backup), so the parser must be dropped.
+  private hotParsers = new Map<string, { parser: SessionParser; mtimeMs: number }>();
+  // Serializes refreshFile per path: watcher events can outpace a slow feed and
+  // two concurrent feeds on one parser would corrupt its accumulators.
+  private fileOps = new Map<string, Promise<void>>();
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange = this._onDidChange.event;
   private refreshing = false;
@@ -144,90 +166,129 @@ export class SessionStore {
 
     let projectDirs: fs.Dirent[];
     try {
-      projectDirs = fs.readdirSync(root, { withFileTypes: true });
+      projectDirs = await fs.promises.readdir(root, { withFileTypes: true });
     } catch {
       this.sessions = next;
       this._onDidChange.fire();
       return;
     }
 
-    for (const pd of projectDirs) {
-      if (!pd.isDirectory()) {
-        continue;
-      }
-      const encodedDir = pd.name;
-      const dirPath = path.join(root, encodedDir);
-      let files: string[];
-      try {
-        files = fs.readdirSync(dirPath);
-      } catch {
-        continue;
-      }
-      for (const f of files) {
-        if (!f.endsWith(".jsonl")) {
-          continue;
-        }
-        const filePath = path.join(dirPath, f);
-        let st: fs.Stats;
-        try {
-          st = fs.statSync(filePath);
-        } catch {
-          continue;
-        }
-        if (!st.isFile()) {
-          continue;
-        }
-        livePaths.add(filePath);
+    // Enumerate + stat everything first (async, so hundreds of stats don't
+    // block the extension host), splitting cache hits from files to parse.
+    interface Candidate {
+      filePath: string;
+      encodedDir: string;
+      st: fs.Stats;
+    }
+    const toParse: Candidate[] = [];
+    await Promise.all(
+      projectDirs
+        .filter((pd) => pd.isDirectory())
+        .map(async (pd) => {
+          const encodedDir = pd.name;
+          const dirPath = path.join(root, encodedDir);
+          let files: string[];
+          try {
+            files = await fs.promises.readdir(dirPath);
+          } catch {
+            return;
+          }
+          await Promise.all(
+            files
+              .filter((f) => f.endsWith(".jsonl"))
+              .map(async (f) => {
+                const filePath = path.join(dirPath, f);
+                let st: fs.Stats;
+                try {
+                  st = await fs.promises.stat(filePath);
+                } catch {
+                  return;
+                }
+                if (!st.isFile()) {
+                  return;
+                }
+                livePaths.add(filePath);
 
-        const cached = this.cache.get(filePath, st.mtimeMs, st.size);
-        if (cached) {
-          // Reuse parse result; status depends on `now`, so recompute it.
-          const activity = lastActivityMs(cached.aggregates, st.mtimeMs);
-          const session: Session = {
-            ...cached,
-            status: this.finalStatus(
-              filePath,
-              computeStatus(activity, cached.aggregates, cfg.thresholds, now),
-              cached.sessionId,
-              activity,
-              st.mtimeMs,
-              now
-            ),
-          };
-          next.set(filePath, session);
-          continue;
-        }
-
-        try {
-          const parsed = await parseSessionFile(
-            filePath,
-            encodedDir,
-            st.mtimeMs,
-            st.size,
-            cfg.thresholds,
-            now
+                const cached = this.cache.get(filePath, st.mtimeMs, st.size);
+                if (cached) {
+                  // Reuse parse result; status depends on `now`, so recompute it.
+                  const activity = lastActivityMs(cached.aggregates, st.mtimeMs);
+                  next.set(filePath, {
+                    ...cached,
+                    status: this.finalStatus(
+                      filePath,
+                      computeStatus(activity, cached.aggregates, cfg.thresholds, now),
+                      cached.sessionId,
+                      activity,
+                      st.mtimeMs,
+                      now
+                    ),
+                  });
+                  return;
+                }
+                toParse.push({ filePath, encodedDir, st });
+              })
           );
-          this.cache.set(parsed);
-          const session: Session = {
-            ...parsed,
-            status: this.finalStatus(
-              filePath,
-              parsed.status,
-              parsed.sessionId,
-              lastActivityMs(parsed.aggregates, st.mtimeMs),
-              st.mtimeMs,
-              now
-            ),
-          };
-          next.set(filePath, session);
-        } catch {
-          // skip unreadable file
-        }
+        })
+    );
+
+    // Parse cache misses with bounded parallelism (cold start parses everything;
+    // steady state this is only files that changed since the last scan).
+    await mapLimit(toParse, SCAN_PARSE_CONCURRENCY, async ({ filePath, encodedDir, st }) => {
+      try {
+        const parsed = await parseSessionFile(
+          filePath,
+          encodedDir,
+          st.mtimeMs,
+          st.size,
+          cfg.thresholds,
+          now
+        );
+        this.cache.set(parsed);
+        next.set(filePath, {
+          ...parsed,
+          status: this.finalStatus(
+            filePath,
+            parsed.status,
+            parsed.sessionId,
+            lastActivityMs(parsed.aggregates, st.mtimeMs),
+            st.mtimeMs,
+            now
+          ),
+        });
+      } catch {
+        // skip unreadable file
+      }
+    });
+
+    // Drop incremental parsers for files that no longer exist. livePaths is a
+    // snapshot from the enumeration phase — a parser created by refreshFile for
+    // a file born mid-scan isn't in it, so double-check the disk before evicting.
+    for (const p of [...this.hotParsers.keys()]) {
+      if (!livePaths.has(p) && !fs.existsSync(p)) {
+        this.hotParsers.delete(p);
       }
     }
-
     this.cache.prune(livePaths);
     void this.cache.flush();
+
+    // Merge instead of wholesale replace: scan() enumerated/statted files at
+    // its start, and a concurrent refreshFile() may have written a FRESHER
+    // parse into this.sessions while we were parsing. Overwriting it with the
+    // older snapshot would revert a live status until the next tick. Keep the
+    // live entry when it reflects a newer file version; keep entries for files
+    // born after the scan's enumeration pass (fresh mtime but absent from
+    // next); genuinely deleted files (old mtime, not re-added) drop out.
+    for (const [p, live] of this.sessions) {
+      const scanned = next.get(p);
+      if (scanned) {
+        if (live.mtimeMs > scanned.mtimeMs) {
+          next.set(p, live);
+        }
+      } else if (!livePaths.has(p) && live.mtimeMs >= now) {
+        next.set(p, live);
+      }
+    }
     this.logStatusChanges(this.sessions, next, cfg.thresholds, now);
     this.sessions = next;
     this._onDidChange.fire();
@@ -255,14 +316,27 @@ export class SessionStore {
   }
 
   // Re-parse a single file (used by the watcher for targeted updates).
+  // Serialized per path: a second call for the same file waits for the first,
+  // so two feeds never run on one incremental parser concurrently.
   async refreshFile(filePath: string): Promise<void> {
+    const prev = this.fileOps.get(filePath) ?? Promise.resolve();
+    const run = prev.then(() => this.doRefreshFile(filePath)).catch(() => undefined);
+    this.fileOps.set(filePath, run);
+    await run;
+    if (this.fileOps.get(filePath) === run) {
+      this.fileOps.delete(filePath);
+    }
+  }
+
+  private async doRefreshFile(filePath: string): Promise<void> {
     const cfg = SessionStore.readConfig();
     const now = Date.now();
     let st: fs.Stats;
     try {
-      st = fs.statSync(filePath);
+      st = await fs.promises.stat(filePath);
     } catch {
       // deleted
+      this.hotParsers.delete(filePath);
       if (this.sessions.delete(filePath)) {
         this._onDidChange.fire();
       }
@@ -293,15 +367,19 @@ export class SessionStore {
       this._onDidChange.fire();
       return;
     }
+    // Incremental fast path: reuse the live parser for this file and consume
+    // only the appended tail. Falls back to a fresh parser (full parse) when
+    // there is none, the file shrank/was rewritten (offset past EOF), or its
+    // mtime went backwards (same-size replacement).
+    const hot = this.hotParsers.get(filePath);
+    let parser = hot?.parser;
+    if (!parser || st.size < parser.byteOffset || (hot && st.mtimeMs < hot.mtimeMs)) {
+      parser = new SessionParser(filePath, encodedDir);
+    }
     try {
-      const parsed = await parseSessionFile(
-        filePath,
-        encodedDir,
-        st.mtimeMs,
-        st.size,
-        cfg.thresholds,
-        now
-      );
+      await parser.feed();
+      const parsed = await parser.finalize(st.mtimeMs, st.size, cfg.thresholds, now);
+      this.hotParserTouch(filePath, parser, st.mtimeMs);
       this.cache.set(parsed);
       const session: Session = {
         ...parsed,
@@ -321,7 +399,22 @@ export class SessionStore {
       void this.cache.flush();
       this._onDidChange.fire();
     } catch {
-      // ignore
+      // Read failed mid-stream: the parser state may be partial — drop it so
+      // the next event does a clean full parse.
+      this.hotParsers.delete(filePath);
+    }
+  }
+
+  // LRU insert/refresh for the incremental-parser pool.
+  private hotParserTouch(filePath: string, parser: SessionParser, mtimeMs: number): void {
+    this.hotParsers.delete(filePath);
+    this.hotParsers.set(filePath, { parser, mtimeMs });
+    while (this.hotParsers.size > HOT_PARSER_MAX) {
+      const oldest = this.hotParsers.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.hotParsers.delete(oldest);
     }
   }
 
@@ -417,6 +510,19 @@ export class SessionStore {
       openPrs,
     };
   }
+}
+
+// Run fn over items with at most `limit` in flight. Individual failures are
+// the callback's business (callers catch inside fn); rejections propagate.
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const item = items[i++];
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
 }
 
 // One-line dump of everything that fed computeStatus, so a wrong status in the

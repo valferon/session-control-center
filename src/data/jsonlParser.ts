@@ -1,10 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as readline from "readline";
 import {
   Aggregates,
   emptyAggregates,
-  PrLink,
   Session,
   SessionStatus,
   SubagentInfo,
@@ -17,50 +15,74 @@ export interface StatusThresholds {
   idleMs: number;
 }
 
-// Parse a single session .jsonl file in one streaming pass. Never loads the
-// whole file into memory (some are >10MB). Returns a fully-populated Session.
-export async function parseSessionFile(
-  filePath: string,
-  encodedDir: string,
-  mtimeMs: number,
-  sizeBytes: number,
-  thresholds: StatusThresholds,
-  now: number
-): Promise<Session> {
-  const sessionId = path.basename(filePath, ".jsonl");
-  const agg = emptyAggregates();
-  const cwdCounts = new Map<string, number>();
-  const modelCounts = new Map<string, number>(); // distinct-message count per real model
-  const filesTouched = new Set<string>();
-  const seenUsageIds = new Set<string>(); // dedup multi-line messages sharing one usage object
+// Incremental streaming parser for a session .jsonl file. Never loads the whole
+// file into memory (some are >10MB) AND never re-reads bytes it has already
+// consumed: feed() picks up at the byte offset where the previous feed()
+// stopped, so a live session that appends a few KB between watcher events costs
+// a few KB of parsing, not a full multi-MB re-parse. finalize() can be called
+// after every feed() and produces an independent Session snapshot.
+//
+// Only COMPLETE (newline-terminated) lines are consumed; a partial line at EOF
+// (a record mid-write) stays unconsumed and is re-read by the next feed(), so
+// no record is ever lost or double-counted across incremental feeds.
+export class SessionParser {
+  private readonly agg = emptyAggregates();
+  private readonly cwdCounts = new Map<string, number>();
+  private readonly modelCounts = new Map<string, number>(); // distinct-message count per real model
+  private readonly filesTouched = new Set<string>();
+  private readonly seenUsageIds = new Set<string>(); // dedup multi-line messages sharing one usage object
   // Maps an in-flight tool_use id to its tool name so the matching tool_result
   // (a later user record) can attribute its payload size to the right tool.
   // Entries are deleted once consumed, so the map stays small.
-  const pendingToolUse = new Map<string, string>();
-  const prUrls = new Set<string>(); // dedup repeated pr-link records
-  let title: string | undefined;
-  let lastPrompt: string | undefined;
-  let gitBranch: string | undefined;
-  let version: string | undefined;
-  let firstTs: string | undefined;
-  let lastTs: string | undefined;
+  private readonly pendingToolUse = new Map<string, string>();
+  private readonly prUrls = new Set<string>(); // dedup repeated pr-link records
+  private title: string | undefined;
+  private lastPrompt: string | undefined;
+  private gitBranch: string | undefined;
+  private version: string | undefined;
+  private firstTs: string | undefined;
+  private lastTs: string | undefined;
+  private offset = 0; // absolute file offset of the first unconsumed byte
 
-  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
-  let streamErr: Error | undefined;
-  stream.on("error", (e) => {
-    streamErr = e instanceof Error ? e : new Error(String(e));
-  });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  constructor(
+    readonly filePath: string,
+    readonly encodedDir: string
+  ) {}
 
-  for await (const line of rl) {
+  get byteOffset(): number {
+    return this.offset;
+  }
+
+  // Consume everything appended since the last feed(). Throws on stream errors
+  // (disk error / file removed mid-read) — caller drops this parser.
+  async feed(): Promise<void> {
+    const stream = fs.createReadStream(this.filePath, { start: this.offset });
+    let pos = this.offset; // absolute offset of buf[0]
+    let leftover: Buffer | undefined;
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      const buf = leftover?.length ? Buffer.concat([leftover, chunk]) : chunk;
+      let lineStart = 0;
+      let nl: number;
+      while ((nl = buf.indexOf(0x0a, lineStart)) !== -1) {
+        this.processLine(buf.subarray(lineStart, nl).toString("utf8"));
+        lineStart = nl + 1;
+      }
+      pos += lineStart;
+      leftover = lineStart < buf.length ? buf.subarray(lineStart) : undefined;
+    }
+    this.offset = pos;
+  }
+
+  private processLine(raw: string): void {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     if (!line) {
-      continue;
+      return;
     }
     let rec: any;
     try {
       rec = JSON.parse(line);
     } catch {
-      continue; // skip malformed / binary-ish lines
+      return; // skip malformed / binary-ish lines
     }
     const type = rec.type;
     // Only records that mark REAL liveness define activity time. Conversation
@@ -71,12 +93,13 @@ export async function parseSessionFile(
     // otherwise push endedAt forward, causing false "active" status.
     const ts: string | undefined = rec.timestamp;
     if (ts && (type === "user" || type === "assistant" || type === "system" || type === "queue-operation")) {
-      if (!firstTs) {
-        firstTs = ts;
+      if (!this.firstTs) {
+        this.firstTs = ts;
       }
-      lastTs = ts;
+      this.lastTs = ts;
     }
 
+    const agg = this.agg;
     if (type === "assistant") {
       agg.assistantTurns++;
       agg.lastConvRole = "assistant";
@@ -89,9 +112,9 @@ export async function parseSessionFile(
         // A multi-block assistant message is written as N lines sharing ONE
         // message.id with an IDENTICAL usage object — count usage/model once.
         const usageKey = typeof msg.id === "string" && msg.id ? msg.id : rec.uuid;
-        const firstSeen = !usageKey || !seenUsageIds.has(usageKey);
+        const firstSeen = !usageKey || !this.seenUsageIds.has(usageKey);
         if (usageKey) {
-          seenUsageIds.add(usageKey);
+          this.seenUsageIds.add(usageKey);
         }
         if (firstSeen) {
           const u = msg.usage;
@@ -103,7 +126,7 @@ export async function parseSessionFile(
           }
           // Skip the placeholder "<synthetic>" model (zero-usage, never selected).
           if (typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
-            modelCounts.set(msg.model, (modelCounts.get(msg.model) ?? 0) + 1);
+            this.modelCounts.set(msg.model, (this.modelCounts.get(msg.model) ?? 0) + 1);
             // Last-write-wins: the session's CURRENT model (tracks /model switches).
             agg.lastModel = msg.model;
           }
@@ -123,7 +146,7 @@ export async function parseSessionFile(
               agg.toolCallsByName[n] = (agg.toolCallsByName[n] ?? 0) + 1;
               agg.toolCharsByName[n] = (agg.toolCharsByName[n] ?? 0) + jsonChars(c.input);
               if (typeof c.id === "string" && c.id) {
-                pendingToolUse.set(c.id, n);
+                this.pendingToolUse.set(c.id, n);
               }
               if (INPUT_PROMPT_TOOLS.has(n)) {
                 blockedOnUser = true;
@@ -133,7 +156,7 @@ export async function parseSessionFile(
         }
         agg.awaitingInput = blockedOnUser;
       }
-      collectContext(rec, cwdCounts, (b) => (gitBranch = b ?? gitBranch), (v) => (version = v ?? version));
+      this.collectContext(rec);
     } else if (type === "user") {
       agg.lastConvRole = "user";
       agg.lastStopReason = undefined;
@@ -158,30 +181,30 @@ export async function parseSessionFile(
       if (Array.isArray(uc)) {
         for (const c of uc) {
           if (c && c.type === "tool_result" && typeof c.tool_use_id === "string") {
-            const name = pendingToolUse.get(c.tool_use_id);
+            const name = this.pendingToolUse.get(c.tool_use_id);
             if (name) {
-              pendingToolUse.delete(c.tool_use_id);
+              this.pendingToolUse.delete(c.tool_use_id);
               agg.toolCharsByName[name] = (agg.toolCharsByName[name] ?? 0) + jsonChars(c.content);
             }
           }
         }
       }
-      collectContext(rec, cwdCounts, (b) => (gitBranch = b ?? gitBranch), (v) => (version = v ?? version));
+      this.collectContext(rec);
     } else if (type === "attachment") {
-      collectContext(rec, cwdCounts, (b) => (gitBranch = b ?? gitBranch), (v) => (version = v ?? version));
+      this.collectContext(rec);
     } else if (type === "ai-title") {
       if (typeof rec.aiTitle === "string" && rec.aiTitle.trim()) {
-        title = rec.aiTitle.trim();
+        this.title = rec.aiTitle.trim();
       }
     } else if (type === "last-prompt") {
       if (typeof rec.lastPrompt === "string" && rec.lastPrompt.trim()) {
-        lastPrompt = rec.lastPrompt.trim();
+        this.lastPrompt = rec.lastPrompt.trim();
       }
     } else if (type === "pr-link") {
       const prUrl = String(rec.prUrl ?? "");
       // The same PR is re-emitted many times; keep one entry per URL.
-      if (prUrl && !prUrls.has(prUrl)) {
-        prUrls.add(prUrl);
+      if (prUrl && !this.prUrls.has(prUrl)) {
+        this.prUrls.add(prUrl);
         agg.prLinks.push({
           prNumber: num(rec.prNumber),
           prUrl,
@@ -193,7 +216,7 @@ export async function parseSessionFile(
       const backups = rec.snapshot?.trackedFileBackups;
       if (backups && typeof backups === "object") {
         for (const k of Object.keys(backups)) {
-          filesTouched.add(k);
+          this.filesTouched.add(k);
         }
       }
     } else if (type === "queue-operation") {
@@ -213,51 +236,86 @@ export async function parseSessionFile(
     }
   }
 
-  if (streamErr) {
-    throw streamErr; // disk error / file removed mid-read — caller skips this file
+  private collectContext(rec: any): void {
+    if (typeof rec.cwd === "string" && rec.cwd) {
+      this.cwdCounts.set(rec.cwd, (this.cwdCounts.get(rec.cwd) ?? 0) + 1);
+    }
+    if (typeof rec.gitBranch === "string" && rec.gitBranch) {
+      this.gitBranch = rec.gitBranch;
+    }
+    if (typeof rec.version === "string" && rec.version) {
+      this.version = rec.version;
+    }
   }
 
-  // Most-used real model first → models[0] drives display + cost rate.
-  agg.models = [...modelCounts.entries()].sort((a, b) => b[1] - a[1]).map(([m]) => m);
-  agg.filesTouched = filesTouched.size;
-  agg.startedAt = firstTs;
-  agg.endedAt = lastTs;
+  // Produce a Session snapshot from the state accumulated so far. Does NOT
+  // mutate parser state (the aggregates are deep-cloned), so feed()/finalize()
+  // can keep alternating on a live file.
+  async finalize(
+    mtimeMs: number,
+    sizeBytes: number,
+    thresholds: StatusThresholds,
+    now: number
+  ): Promise<Session> {
+    const sessionId = path.basename(this.filePath, ".jsonl");
+    const agg = structuredClone(this.agg);
 
-  // Collapse every recorded cwd onto its enclosing git repo root before picking
-  // the winner. Without this, a session whose agent `cd`'d into a subdir (e.g.
-  // ./backend) can have MORE records under the subdir than the repo root, so the
-  // raw most-frequent cwd points at the subfolder — spawning a phantom project
-  // group named after it. Summing counts per root makes repo-root selection
-  // robust to mid-session directory changes.
-  const rootCounts = new Map<string, number>();
-  for (const [c, n] of cwdCounts) {
-    const root = resolveRepoRoot(c);
-    rootCounts.set(root, (rootCounts.get(root) ?? 0) + n);
+    // Most-used real model first → models[0] drives display + cost rate.
+    agg.models = [...this.modelCounts.entries()].sort((a, b) => b[1] - a[1]).map(([m]) => m);
+    agg.filesTouched = this.filesTouched.size;
+    agg.startedAt = this.firstTs;
+    agg.endedAt = this.lastTs;
+
+    // Collapse every recorded cwd onto its enclosing git repo root before picking
+    // the winner. Without this, a session whose agent `cd`'d into a subdir (e.g.
+    // ./backend) can have MORE records under the subdir than the repo root, so the
+    // raw most-frequent cwd points at the subfolder — spawning a phantom project
+    // group named after it. Summing counts per root makes repo-root selection
+    // robust to mid-session directory changes.
+    const rootCounts = new Map<string, number>();
+    for (const [c, n] of this.cwdCounts) {
+      const root = resolveRepoRoot(c);
+      rootCounts.set(root, (rootCounts.get(root) ?? 0) + n);
+    }
+    const cwd = mostFrequent(rootCounts);
+    const cwdVerified = cwd !== undefined;
+    const costUsd = estimateCost(agg.tokens, agg.models);
+    const subagents = await readSubagents(this.filePath, sessionId);
+    agg.hasSidechain = subagents.length > 0;
+    const status = computeStatus(lastActivityMs(agg, mtimeMs), agg, thresholds, now);
+
+    return {
+      sessionId,
+      filePath: this.filePath,
+      encodedDir: this.encodedDir,
+      cwd,
+      cwdVerified,
+      gitBranch: this.gitBranch,
+      version: this.version,
+      title: this.title,
+      lastPrompt: this.lastPrompt,
+      status,
+      mtimeMs,
+      sizeBytes,
+      aggregates: agg,
+      subagents,
+      costUsd,
+    };
   }
-  const cwd = mostFrequent(rootCounts);
-  const cwdVerified = cwd !== undefined;
-  const costUsd = estimateCost(agg.tokens, agg.models);
-  const subagents = await readSubagents(filePath, sessionId);
-  agg.hasSidechain = subagents.length > 0;
-  const status = computeStatus(lastActivityMs(agg, mtimeMs), agg, thresholds, now);
+}
 
-  return {
-    sessionId,
-    filePath,
-    encodedDir,
-    cwd,
-    cwdVerified,
-    gitBranch,
-    version,
-    title,
-    lastPrompt,
-    status,
-    mtimeMs,
-    sizeBytes,
-    aggregates: agg,
-    subagents,
-    costUsd,
-  };
+// Parse a session .jsonl file in one full streaming pass (cold-scan path).
+export async function parseSessionFile(
+  filePath: string,
+  encodedDir: string,
+  mtimeMs: number,
+  sizeBytes: number,
+  thresholds: StatusThresholds,
+  now: number
+): Promise<Session> {
+  const parser = new SessionParser(filePath, encodedDir);
+  await parser.feed();
+  return parser.finalize(mtimeMs, sizeBytes, thresholds, now);
 }
 
 // Effective last-activity time: prefer the last record that carried a real
@@ -394,23 +452,6 @@ function isRealPrompt(message: any): boolean {
     return !content.some((c) => c && c.type === "tool_result");
   }
   return false;
-}
-
-function collectContext(
-  rec: any,
-  cwdCounts: Map<string, number>,
-  setBranch: (b?: string) => void,
-  setVersion: (v?: string) => void
-): void {
-  if (typeof rec.cwd === "string" && rec.cwd) {
-    cwdCounts.set(rec.cwd, (cwdCounts.get(rec.cwd) ?? 0) + 1);
-  }
-  if (typeof rec.gitBranch === "string" && rec.gitBranch) {
-    setBranch(rec.gitBranch);
-  }
-  if (typeof rec.version === "string" && rec.version) {
-    setVersion(rec.version);
-  }
 }
 
 async function readSubagents(filePath: string, sessionId: string): Promise<SubagentInfo[]> {

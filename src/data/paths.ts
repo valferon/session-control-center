@@ -132,6 +132,16 @@ export function dirExists(p: string): boolean {
   }
 }
 
+// Memoized dir -> repo-root results. resolveRepoRoot runs for every distinct
+// cwd of every parsed session (each lookup is a stat-walk up to the fs root);
+// sessions overwhelmingly share a handful of cwds, so this collapses thousands
+// of stat calls per scan into map hits. Entries live for the extension-host
+// process lifetime: a `.git` created or deleted AFTER the first lookup keeps
+// returning the old root until a window reload. That only affects sidebar
+// grouping labels — accepted trade-off for skipping the stat-walk per parse.
+const repoRootCache = new Map<string, string>();
+const REPO_ROOT_CACHE_MAX = 2000;
+
 // Walk up from a directory to the nearest enclosing git repo root (the dir that
 // holds a `.git` entry — a real dir for normal clones, a file for worktrees and
 // submodules). Returns that root, or the input unchanged if none is found or the
@@ -139,11 +149,17 @@ export function dirExists(p: string): boolean {
 // into e.g. ./backend) back onto the repo they belong to, so a subfolder never
 // spawns a phantom project group named after itself.
 export function resolveRepoRoot(dir: string): string {
+  const cached = repoRootCache.get(dir);
+  if (cached !== undefined) {
+    return cached;
+  }
+  let result = dir;
   let cur = dir;
   for (let i = 0; i < 40; i++) {
     try {
       if (fs.existsSync(path.join(cur, ".git"))) {
-        return cur;
+        result = cur;
+        break;
       }
     } catch {
       // unreadable; keep walking up
@@ -154,5 +170,9 @@ export function resolveRepoRoot(dir: string): string {
     }
     cur = parent;
   }
-  return dir;
+  if (repoRootCache.size >= REPO_ROOT_CACHE_MAX) {
+    repoRootCache.clear(); // crude but rare; avoids unbounded growth
+  }
+  repoRootCache.set(dir, result);
+  return result;
 }
