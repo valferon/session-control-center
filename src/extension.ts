@@ -19,7 +19,7 @@ import { SessionNotifier } from "./notifications/notifier";
 import { UsageService } from "./data/usageService";
 import { lastActivityMs } from "./data/jsonlParser";
 import { modelSettingsFile, readModelSettings, writeModelSetting } from "./data/paths";
-import { activeTabKey } from "./util/activeClaudeTab";
+import { activeTabKey, findActiveClaudeSession } from "./util/activeClaudeTab";
 import { initLog, log } from "./util/log";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -100,6 +100,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const usageTick = setInterval(() => void usage.refresh(), 300_000);
   context.subscriptions.push({ dispose: () => clearInterval(usageTick) });
 
+  // Looking at a session IS reviewing it: when this window is focused and the
+  // active editor tab is a Claude conversation panel showing a pendingReview
+  // session, mark it seen — no sidebar click required. Covers the "alt-tab to
+  // the window where the finished session's tab is already open" gap: that
+  // switch fires no sidebar action, only window/tab events. Best-effort like
+  // every tab↔session join here (matches by tab label vs session title, so
+  // untitled sessions still need an explicit open).
+  //
+  // Re-entry is bounded, not looping: markSeen -> seen change -> store.refresh
+  // -> store change -> here again, but by then the overlay reads "finished" and
+  // the status gate skips. lastAutoMark additionally dedups the window BETWEEN
+  // the (unawaited) markSeen and that refresh landing, where extra watcher
+  // events would otherwise re-mark the same session+watermark with an ever-
+  // higher Date.now() and write a shard each time.
+  let lastAutoMark = "";
+  const markFocusedSessionSeen = () => {
+    if (!vscode.window.state.focused) {
+      return; // tab may be "active" in an unfocused background window
+    }
+    const s = findActiveClaudeSession(store);
+    if (!s || s.status !== "pendingReview") {
+      return;
+    }
+    const markKey = `${s.sessionId}:${lastActivityMs(s.aggregates, s.mtimeMs)}`;
+    if (markKey === lastAutoMark) {
+      return; // already marked at this watermark; refresh hasn't landed yet
+    }
+    lastAutoMark = markKey;
+    log(`auto-mark reviewed (focused tab): ${s.sessionId.slice(0, 8)} "${s.title ?? ""}"`);
+    // Same watermark semantics as openSession: wall-clock now, floored at the
+    // parsed watermark — the parse can lag the file, and marking at a stale
+    // watermark would leave the session pendingReview on the next re-scan.
+    void seen.markSeen(s.sessionId, Math.max(lastActivityMs(s.aggregates, s.mtimeMs), Date.now()));
+  };
+  // A session that flips to pendingReview WHILE its tab is focused (you watched
+  // it finish) is also instantly reviewed.
+  context.subscriptions.push(store.onDidChange(markFocusedSessionSeen));
+
   // The "model (focused session)" stat in the tree follows the focused editor
   // tab; refresh the tree when the active tab changes so it tracks what you're
   // actually looking at. Keyed so tab events that don't move focus (e.g. a
@@ -109,6 +147,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const key = activeTabKey();
     if (key !== lastTabKey) {
       lastTabKey = key;
+      markFocusedSessionSeen();
       treeProvider.refresh();
     }
   };
@@ -287,6 +326,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Catch up on marks made in other windows the instant you switch back,
         // instead of waiting for the watcher (best-effort) or the 30s tick.
         void seen.sync();
+        // Alt-tabbing into this window with a session's tab already active
+        // counts as reviewing it — no tab event fires on a plain window switch.
+        markFocusedSessionSeen();
       }
     })
   );
