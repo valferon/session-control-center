@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { Session } from "../model/types";
+import { WINDOW_ID } from "../util/windowId";
 
 interface CacheEntry {
   mtimeMs: number;
@@ -108,8 +109,9 @@ export class SessionCache {
   }
 }
 
-// Filesystem-safe id for this window (vscode.env.sessionId is unique per
-// window but its format is unspecified — strip anything path-hostile).
+// Per-window id for the flush temp file (vscode.env.sessionId is a constant
+// placeholder in VSCodium, so two windows could collide on one temp name and
+// interleave a flush — see util/windowId.ts).
 function windowId(): string {
-  return vscode.env.sessionId.replace(/[^a-zA-Z0-9._-]/g, "");
+  return WINDOW_ID;
 }

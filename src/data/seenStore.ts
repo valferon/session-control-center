@@ -1,11 +1,15 @@
 import * as vscode from "vscode";
+import { WINDOW_ID } from "../util/windowId";
 
 const KEY = "claudeControlCenter.seenSessions";
 // This window's own shard. Every window writes ONLY its own shard, so two
 // windows never write the same file and can never clobber each other. The
 // truth is the union of all shards, merged per-session by max(mtimeMs).
-// (sessionId's format is unspecified — strip anything path-hostile.)
-const OWN_FILE = `seen-${vscode.env.sessionId.replace(/[^a-zA-Z0-9._-]/g, "")}.json`;
+// Keyed on WINDOW_ID, NOT vscode.env.sessionId: VSCodium returns the literal
+// placeholder "someValue.sessionId" in every window, which collapsed all
+// windows onto ONE shard file and reintroduced the exact lost-update clobber
+// this sharding exists to prevent.
+const OWN_FILE = `seen-${WINDOW_ID}.json`;
 // Matches OWN_FILE for every window AND the legacy single-file location
 // (seen-sessions.json), so old data folds into the union for free.
 const SHARD_GLOB = "seen-*.json";
@@ -60,8 +64,8 @@ export class SeenStore {
     await this.mergeAllShards();
     // `own` starts EMPTY: this window persists only the marks it makes itself.
     // Seeding it from the union made every window rewrite the whole union into
-    // a fresh per-reload shard (the shard name embeds vscode.env.sessionId,
-    // which changes on every reload), growing storage O(reloads × sessions).
+    // a fresh per-reload shard (the shard name embeds WINDOW_ID, which changes
+    // on every reload), growing storage O(reloads × sessions).
 
     // One-time migration: seed from the legacy globalState map so existing
     // "checked" marks aren't lost on upgrade. Compared against the merged

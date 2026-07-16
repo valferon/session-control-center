@@ -7,6 +7,7 @@ import { lastActivityMs } from "../data/jsonlParser";
 import { dirExists } from "../data/paths";
 import { Session } from "../model/types";
 import { log } from "../util/log";
+import { WINDOW_ID } from "../util/windowId";
 
 type OpenMode = "newWindow" | "currentWindow" | "prompt";
 
@@ -175,7 +176,7 @@ export async function openSession(
     sessionId: session.sessionId,
     cwd,
     ts: Date.now(),
-    srcWindow: vscode.env.sessionId,
+    srcWindow: WINDOW_ID,
   });
   await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(cwd), { forceNewWindow: true });
 }
@@ -205,7 +206,7 @@ export async function consumePendingOpenSession(context: vscode.ExtensionContext
     await context.globalState.update(PENDING_OPEN_KEY, undefined);
     return;
   }
-  if (p.srcWindow && p.srcWindow === vscode.env.sessionId) {
+  if (p.srcWindow && p.srcWindow === WINDOW_ID) {
     return; // our own request; the target window consumes it
   }
   if (inCurrentWorkspace(p.cwd)) {
@@ -263,7 +264,7 @@ export async function startClaudeInCwd(context: vscode.ExtensionContext, cwd?: s
     action: "new",
     cwd,
     ts: Date.now(),
-    srcWindow: vscode.env.sessionId,
+    srcWindow: WINDOW_ID,
   });
   await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(cwd), { forceNewWindow: true });
 }
