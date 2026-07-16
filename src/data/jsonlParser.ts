@@ -15,6 +15,15 @@ export interface StatusThresholds {
   idleMs: number;
 }
 
+// Cap on the consumed-bytes signature used to detect in-place rewrites (see
+// SessionParser.tail). The verified window is the LAST CONSUMED LINE (capped
+// here): jsonl line endings are near-constant ("}]}}"-style suffixes), so a
+// short fixed window can collide across same-length records — a full line
+// carries timestamp/message-id and only matches if the same record still ends
+// at the same offset. The cap bounds the re-read when the last line is a huge
+// tool_result.
+const TAIL_SIG_BYTES = 4096;
+
 // Incremental streaming parser for a session .jsonl file. Never loads the whole
 // file into memory (some are >10MB) AND never re-reads bytes it has already
 // consumed: feed() picks up at the byte offset where the previous feed()
@@ -43,6 +52,16 @@ export class SessionParser {
   private firstTs: string | undefined;
   private lastTs: string | undefined;
   private offset = 0; // absolute file offset of the first unconsumed byte
+  // Last ≤TAIL_SIG_BYTES consumed bytes (always ends on the '\n' that closed
+  // the last consumed line). tailIntact() re-reads these bytes from disk to
+  // detect a file that was REWRITTEN in place (e.g. /rewind truncates and
+  // re-appends): offset/size checks miss a shrink-then-regrow between watcher
+  // events, and feeding from a stale offset would parse garbage — worse, the
+  // garbage aggregates get cached by (mtime,size) and the wrong status sticks.
+  private tail = Buffer.alloc(0);
+  // Byte length (incl. '\n') of the last fully consumed line — the verified
+  // window is min(this, tail length): one whole line, not a fixed suffix.
+  private lastLineBytes = 0;
 
   constructor(
     readonly filePath: string,
@@ -51,6 +70,42 @@ export class SessionParser {
 
   get byteOffset(): number {
     return this.offset;
+  }
+
+  // True when the on-disk bytes immediately before `offset` still match what
+  // this parser consumed — i.e. the file only grew by appends. False means the
+  // file was rewritten and the parser state is invalid (caller starts fresh).
+  async tailIntact(): Promise<boolean> {
+    const sigLen = Math.min(this.lastLineBytes, this.tail.length);
+    if (this.offset === 0 || sigLen === 0) {
+      return true;
+    }
+    const sig = this.tail.subarray(this.tail.length - sigLen);
+    let fh: fs.promises.FileHandle | undefined;
+    try {
+      fh = await fs.promises.open(this.filePath, "r");
+      const buf = Buffer.alloc(sigLen);
+      const { bytesRead } = await fh.read(buf, 0, sigLen, this.offset - sigLen);
+      return bytesRead === sigLen && buf.equals(sig);
+    } catch {
+      return false; // unreadable right now — treat as rewritten, full reparse
+    } finally {
+      await fh?.close().catch(() => undefined);
+    }
+  }
+
+  // Keep the rolling last-consumed-bytes signature current. Copies (never
+  // subarray-views) so a 32-byte signature doesn't pin a whole stream chunk.
+  private pushTail(consumed: Buffer): void {
+    if (consumed.length === 0) {
+      return;
+    }
+    if (consumed.length >= TAIL_SIG_BYTES) {
+      this.tail = Buffer.from(consumed.subarray(consumed.length - TAIL_SIG_BYTES));
+      return;
+    }
+    const joined = Buffer.concat([this.tail, consumed]);
+    this.tail = Buffer.from(joined.subarray(Math.max(0, joined.length - TAIL_SIG_BYTES)));
   }
 
   // Consume everything appended since the last feed(). Throws on stream errors
@@ -65,8 +120,10 @@ export class SessionParser {
       let nl: number;
       while ((nl = buf.indexOf(0x0a, lineStart)) !== -1) {
         this.processLine(buf.subarray(lineStart, nl).toString("utf8"));
+        this.lastLineBytes = nl - lineStart + 1; // leftover was prepended, so this spans the whole line
         lineStart = nl + 1;
       }
+      this.pushTail(buf.subarray(0, lineStart));
       pos += lineStart;
       leftover = lineStart < buf.length ? buf.subarray(lineStart) : undefined;
     }
@@ -85,14 +142,29 @@ export class SessionParser {
       return; // skip malformed / binary-ish lines
     }
     const type = rec.type;
+    // Synthetic user records (command echoes, task notifications, IDE context
+    // injections — see isSyntheticEcho) opened no conversational turn. They
+    // must not touch role/stop/awaiting/interrupted state (a tail echo
+    // otherwise reads as a dangling turn -> false interrupted, and it clears a
+    // pending "awaiting") nor move the activity watermark (which would flip a
+    // reviewed session back to pendingReview).
+    const syntheticEcho = type === "user" && isSyntheticEcho(rec.message);
     // Only records that mark REAL liveness define activity time. Conversation
     // (user/assistant) obviously; queue-operation = the human queued/removed a
-    // prompt; system = the harness did something (api_error retries, hook runs)
-    // proving the process is alive. Non-conversational REWRITES
-    // (file-history-snapshot, ai-title) carry timestamps too and would
-    // otherwise push endedAt forward, causing false "active" status.
+    // prompt; system records only for subtypes that prove a turn is in flight
+    // (see LIVENESS_SYSTEM_SUBTYPES — post-hoc annotations like away_summary
+    // are written minutes AFTER the turn ended and must not count).
+    // Non-conversational REWRITES (file-history-snapshot, ai-title) carry
+    // timestamps too and would otherwise push endedAt forward, causing false
+    // "active" status.
     const ts: string | undefined = rec.timestamp;
-    if (ts && (type === "user" || type === "assistant" || type === "system" || type === "queue-operation")) {
+    const isLive =
+      type === "user"
+        ? !syntheticEcho
+        : type === "assistant" || type === "queue-operation"
+          ? true
+          : type === "system" && LIVENESS_SYSTEM_SUBTYPES.has(String(rec.subtype));
+    if (ts && isLive) {
       if (!this.firstTs) {
         this.firstTs = ts;
       }
@@ -158,6 +230,13 @@ export class SessionParser {
       }
       this.collectContext(rec);
     } else if (type === "user") {
+      if (syntheticEcho) {
+        // Still worth harvesting cwd/branch, but none of the conversational
+        // state below may change: the session is exactly as finished /
+        // awaiting / interrupted as it was before the command ran.
+        this.collectContext(rec);
+        return;
+      }
       agg.lastConvRole = "user";
       agg.lastStopReason = undefined;
       // A user record after a prompt = the prompt was answered (or a new human
@@ -332,6 +411,19 @@ export function lastActivityMs(agg: Aggregates, mtimeMs: number): number {
   return mtimeMs;
 }
 
+// system-record subtypes that prove a turn is IN FLIGHT (api retry loops write
+// only these between attempts) and so count as liveness. Everything else is a
+// post-hoc annotation written AFTER the turn ended — stop_hook_summary /
+// turn_duration land ms after end_turn (harmless but useless), and
+// away_summary lands MINUTES later (observed 3+ min: it's generated when you
+// come back to the session), which moved the activity watermark past the
+// user's "seen" mark and flipped reviewed sessions back to pendingReview.
+// Whitelist, not blacklist: an unknown future subtype defaulting to liveness
+// would reintroduce that bug class, while defaulting to non-liveness costs at
+// worst a slightly early interrupted flag (already cushioned by the tool-run
+// grace below).
+const LIVENESS_SYSTEM_SUBTYPES = new Set(["api_error", "model_refusal_fallback"]);
+
 // stop_reason values that mean the assistant turn ended on its own (task done,
 // ball in the user's court). Anything else recent = a turn is still in flight.
 // Deliberately NOT here: "max_tokens" (output truncated — incomplete, so the
@@ -436,6 +528,73 @@ function isInterruptMarker(message: any): boolean {
     );
   }
   return false;
+}
+
+// Synthetic user records Claude Code writes on its own — no human turn opened:
+//  - UI command echoes (/model, /mcp …): tag blobs like
+//    <command-name>…</command-name><command-message>…, <local-command-stdout>,
+//    <local-command-caveat>. Multi-tag, so corroborated by the matching
+//    closing tag appearing anywhere in the text.
+//  - Standalone notices: <task-notification> (background task finished),
+//    <ide_opened_file>/<ide_selection> (IDE context injections). These arrive
+//    at arbitrary times AFTER a turn ended (a notification can land hours
+//    later; opening files in the IDE writes ide_opened_file records while the
+//    session just sits there), so treating them as conversation flipped
+//    finished sessions to interrupted/active and reviewed back to
+//    pendingReview. Corroborated as the ENTIRE text (closing tag with nothing
+//    but whitespace after) so a real prompt that merely pastes such a block
+//    and adds commentary still counts as a prompt.
+// A record is synthetic only if it has at least one text payload and EVERY
+// text payload matches (an ide_selection block bundled with a real typed
+// prompt block must count as a real prompt).
+const COMMAND_ECHO_FAMILIES = ["command-", "local-command"];
+const STANDALONE_SYNTHETIC_TAGS = ["task-notification", "ide_opened_file", "ide_selection"];
+
+function isSyntheticEcho(message: any): boolean {
+  const texts = textPayloads(message);
+  return texts.length > 0 && texts.every(isSyntheticText);
+}
+
+function isSyntheticText(text: string): boolean {
+  const t = text.trim();
+  if (!t.startsWith("<")) {
+    return false;
+  }
+  for (const fam of COMMAND_ECHO_FAMILIES) {
+    if (t.startsWith(`<${fam}`) && t.includes(`</${fam}`)) {
+      return true;
+    }
+  }
+  for (const tag of STANDALONE_SYNTHETIC_TAGS) {
+    if (t.startsWith(`<${tag}`)) {
+      const close = `</${tag}>`;
+      const idx = t.indexOf(close);
+      if (idx !== -1 && t.slice(idx + close.length).trim() === "") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// All text payloads of a user message (string content or text blocks).
+function textPayloads(message: any): string[] {
+  if (!message) {
+    return [];
+  }
+  const content = message.content;
+  if (typeof content === "string") {
+    return [content];
+  }
+  const out: string[] = [];
+  if (Array.isArray(content)) {
+    for (const c of content) {
+      if (c && c.type === "text" && typeof c.text === "string") {
+        out.push(c.text);
+      }
+    }
+  }
+  return out;
 }
 
 // A user record is a real human prompt only if it isn't a tool_result echo.

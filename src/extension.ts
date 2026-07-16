@@ -31,6 +31,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await seen.load();
   context.subscriptions.push({ dispose: () => seen.dispose() });
   const store = new SessionStore(cache, seen);
+  context.subscriptions.push({ dispose: () => store.dispose() });
   const usage = new UsageService(context.globalStorageUri);
   context.subscriptions.push({ dispose: () => usage.dispose() });
   const archive = new ArchiveStore(context.globalState);

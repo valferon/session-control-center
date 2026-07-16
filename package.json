@@ -333,7 +333,9 @@
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
     "package": "node esbuild.mjs --production && vsce package --no-dependencies",
-    "publish:ovsx": "node esbuild.mjs --production && ovsx publish --no-dependencies"
+    "publish:ovsx": "node esbuild.mjs --production && ovsx publish --no-dependencies",
+    "test": "node scripts/run-tests.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

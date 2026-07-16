@@ -50,10 +50,15 @@ export class SessionStore {
   // Serializes refreshFile per path: watcher events can outpace a slow feed and
   // two concurrent feeds on one parser would corrupt its accumulators.
   private fileOps = new Map<string, Promise<void>>();
+  // One-shot settle timers (see scheduleSettle).
+  private settleTimers = new Map<string, NodeJS.Timeout>();
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange = this._onDidChange.event;
   private refreshing = false;
   private rerunRequested = false;
+  // Set by dispose(): in-flight async work must not re-arm timers or fire the
+  // (already disposed) change emitter afterwards.
+  private disposed = false;
 
   constructor(
     private readonly cache: SessionCache,
@@ -100,9 +105,39 @@ export class SessionStore {
       (overlaid === "finished" || overlaid === "pendingReview") &&
       now - mtimeMs < HOT_FILE_GRACE_MS
     ) {
+      // Holding a live status is only safe if SOMETHING re-evaluates after the
+      // grace expires. A real finish stops the writes, so no watcher event is
+      // coming — without this timer the downgrade waited for the 30s tick,
+      // leaving a finished session showing "active" for up to grace+30s.
+      this.scheduleSettle(filePath);
       return prev;
     }
     return overlaid;
+  }
+
+  // One-shot re-check of a file shortly after its downgrade grace expires.
+  // Deduped per path; cleared when it fires (refreshFile recomputes and, if
+  // the grace still applies, re-arms).
+  private scheduleSettle(filePath: string): void {
+    if (this.disposed || this.settleTimers.has(filePath)) {
+      return;
+    }
+    this.settleTimers.set(
+      filePath,
+      setTimeout(() => {
+        this.settleTimers.delete(filePath);
+        void this.refreshFile(filePath);
+      }, HOT_FILE_GRACE_MS + 1_000)
+    );
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    for (const t of this.settleTimers.values()) {
+      clearTimeout(t);
+    }
+    this.settleTimers.clear();
+    this._onDidChange.dispose();
   }
 
   static readConfig(): StoreConfig {
@@ -139,6 +174,9 @@ export class SessionStore {
 
   // Full reconcile of the projects dir. Coalesces concurrent calls.
   async refresh(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     if (this.refreshing) {
       this.rerunRequested = true;
       return;
@@ -329,6 +367,9 @@ export class SessionStore {
   }
 
   private async doRefreshFile(filePath: string): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     const cfg = SessionStore.readConfig();
     const now = Date.now();
     let st: fs.Stats;
@@ -340,6 +381,14 @@ export class SessionStore {
       if (this.sessions.delete(filePath)) {
         this._onDidChange.fire();
       }
+      return;
+    }
+    // A concurrent scan (or an earlier queued refresh) may have already stored
+    // a parse of a NEWER file version; recomputing from this older stat and
+    // unconditionally storing it would clobber the fresher status until the
+    // next event. Equal mtime still refreshes (time-based status recompute).
+    const existing = this.sessions.get(filePath);
+    if (existing && existing.mtimeMs > st.mtimeMs) {
       return;
     }
     const encodedDir = path.basename(path.dirname(filePath));
@@ -369,15 +418,31 @@ export class SessionStore {
     }
     // Incremental fast path: reuse the live parser for this file and consume
     // only the appended tail. Falls back to a fresh parser (full parse) when
-    // there is none, the file shrank/was rewritten (offset past EOF), or its
-    // mtime went backwards (same-size replacement).
+    // there is none, the file shrank/was rewritten (offset past EOF), its
+    // mtime went backwards (same-size replacement), or the bytes just before
+    // the parser's offset no longer match what it consumed (in-place rewrite
+    // that shrank AND regrew between watcher events — e.g. /rewind — which the
+    // size/mtime checks cannot see and would corrupt the incremental parse).
     const hot = this.hotParsers.get(filePath);
     let parser = hot?.parser;
-    if (!parser || st.size < parser.byteOffset || (hot && st.mtimeMs < hot.mtimeMs)) {
+    if (
+      !parser ||
+      st.size < parser.byteOffset ||
+      (hot && st.mtimeMs < hot.mtimeMs) ||
+      !(await parser.tailIntact())
+    ) {
       parser = new SessionParser(filePath, encodedDir);
     }
     try {
       await parser.feed();
+      // Re-verify AFTER consuming: a rewrite that lands between the pre-check
+      // and the read stream (or during it) leaves the parser holding garbage.
+      // Detected now, it costs one clean full parse instead of a wrong status
+      // cached under the current (mtime,size).
+      if (!(await parser.tailIntact())) {
+        parser = new SessionParser(filePath, encodedDir);
+        await parser.feed();
+      }
       const parsed = await parser.finalize(st.mtimeMs, st.size, cfg.thresholds, now);
       this.hotParserTouch(filePath, parser, st.mtimeMs);
       this.cache.set(parsed);

@@ -14,3 +14,5 @@ esbuild.mjs
 pnpm-lock.yaml
 pnpm-workspace.yaml
 !dist/**
+scripts/**
+dist-test/**

@@ -8,7 +8,7 @@ interface CacheEntry {
 }
 
 interface CacheFile {
-  version: 6;
+  version: typeof CACHE_VERSION;
   entries: Record<string, CacheEntry>; // key = filePath
 }
 
@@ -22,7 +22,11 @@ const CACHE_NAME = "session-cache.json";
 //     tool/MCP usage panel); discard v4 entries so they get populated.
 // v6: aggregates gained `lastModel` (the session's current model, tracks
 //     mid-session /model switches); discard v5 entries so it gets populated.
-const CACHE_VERSION = 6 as const;
+// v7: activity/status semantics changed — system records now count as liveness
+//     only for in-flight subtypes (away_summary et al. no longer move the
+//     watermark) and local-command echo user records no longer touch
+//     conversational state; discard v6 entries so endedAt/status re-derive.
+const CACHE_VERSION = 7 as const;
 
 // Persisted per-session aggregate cache, keyed by file path + (mtime,size).
 // Lives in globalStorageUri so it survives reloads and is trivially nukable.
