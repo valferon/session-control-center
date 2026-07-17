@@ -7,7 +7,15 @@ import {
   Session,
   SessionStatus,
 } from "../model/types";
-import { computeStatus, lastActivityMs, parseSessionFile, SessionParser, StatusThresholds } from "./jsonlParser";
+import {
+  computeStatus,
+  lastActivityMs,
+  parseSessionFile,
+  probeSidechain,
+  SessionParser,
+  SidechainProbe,
+  StatusThresholds,
+} from "./jsonlParser";
 import { decodeEncodedDir, resolveProjectsDir } from "./paths";
 import { SessionCache } from "./cache";
 import { SeenStore } from "./seenStore";
@@ -113,6 +121,23 @@ export class SessionStore {
       return prev;
     }
     return overlaid;
+  }
+
+  // Sidechain probe (newest agent-log mtime + currently running agents),
+  // gated to sessions that aren't idle anyway (readdir + a few stats per
+  // session per evaluation; an idle session can't be flipped by sidechain
+  // activity, so don't pay for it).
+  private async sidechainActivity(
+    filePath: string,
+    sessionId: string,
+    activityMs: number,
+    now: number,
+    thresholds: StatusThresholds
+  ): Promise<SidechainProbe> {
+    if (now - activityMs > thresholds.idleMs) {
+      return { newestMtimeMs: 0, running: [] };
+    }
+    return probeSidechain(filePath, sessionId, thresholds, now);
   }
 
   // One-shot re-check of a file shortly after its downgrade grace expires.
@@ -249,13 +274,17 @@ export class SessionStore {
 
                 const cached = this.cache.get(filePath, st.mtimeMs, st.size);
                 if (cached) {
-                  // Reuse parse result; status depends on `now`, so recompute it.
+                  // Reuse parse result; status depends on `now` and on
+                  // sidechain freshness (both move without the file changing),
+                  // so recompute it.
                   const activity = lastActivityMs(cached.aggregates, st.mtimeMs);
+                  const sidechain = await this.sidechainActivity(filePath, cached.sessionId, activity, now, cfg.thresholds);
                   next.set(filePath, {
                     ...cached,
+                    runningAgents: sidechain.running,
                     status: this.finalStatus(
                       filePath,
-                      computeStatus(activity, cached.aggregates, cfg.thresholds, now),
+                      computeStatus(activity, cached.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
                       cached.sessionId,
                       activity,
                       st.mtimeMs,
@@ -283,13 +312,16 @@ export class SessionStore {
           now
         );
         this.cache.set(parsed);
+        const activity = lastActivityMs(parsed.aggregates, st.mtimeMs);
+        const sidechain = await this.sidechainActivity(filePath, parsed.sessionId, activity, now, cfg.thresholds);
         next.set(filePath, {
           ...parsed,
+          runningAgents: sidechain.running,
           status: this.finalStatus(
             filePath,
-            parsed.status,
+            computeStatus(activity, parsed.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
             parsed.sessionId,
-            lastActivityMs(parsed.aggregates, st.mtimeMs),
+            activity,
             st.mtimeMs,
             now
           ),
@@ -398,11 +430,13 @@ export class SessionStore {
     const cached = this.cache.get(filePath, st.mtimeMs, st.size);
     if (cached) {
       const activity = lastActivityMs(cached.aggregates, st.mtimeMs);
+      const sidechain = await this.sidechainActivity(filePath, cached.sessionId, activity, now, cfg.thresholds);
       const session: Session = {
         ...cached,
+        runningAgents: sidechain.running,
         status: this.finalStatus(
           filePath,
-          computeStatus(activity, cached.aggregates, cfg.thresholds, now),
+          computeStatus(activity, cached.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
           cached.sessionId,
           activity,
           st.mtimeMs,
@@ -446,13 +480,16 @@ export class SessionStore {
       const parsed = await parser.finalize(st.mtimeMs, st.size, cfg.thresholds, now);
       this.hotParserTouch(filePath, parser, st.mtimeMs);
       this.cache.set(parsed);
+      const activity = lastActivityMs(parsed.aggregates, st.mtimeMs);
+      const sidechain = await this.sidechainActivity(filePath, parsed.sessionId, activity, now, cfg.thresholds);
       const session: Session = {
         ...parsed,
+        runningAgents: sidechain.running,
         status: this.finalStatus(
           filePath,
-          parsed.status,
+          computeStatus(activity, parsed.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
           parsed.sessionId,
-          lastActivityMs(parsed.aggregates, st.mtimeMs),
+          activity,
           st.mtimeMs,
           now
         ),

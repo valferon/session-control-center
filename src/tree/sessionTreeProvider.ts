@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ProjectGroup, Session, SessionStatus, UsageWindow } from "../model/types";
+import { ProjectGroup, RunningAgent, Session, SessionStatus, UsageWindow } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
 import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
@@ -45,10 +45,19 @@ export class SessionNode extends vscode.TreeItem {
   constructor(
     public readonly session: Session,
     public readonly archived = false,
-    iconsBase?: vscode.Uri,
+    public readonly iconsBase?: vscode.Uri,
     revision = 0
   ) {
-    super(SessionNode.label(session), vscode.TreeItemCollapsibleState.None);
+    // Sessions are leaves EXCEPT while subagents are running: those get an
+    // indented child row per live agent. Expanded (not Collapsed) because the
+    // whole point is seeing them without a click; the id is revision-salted
+    // anyway, so VS Code can't persist a manual collapse across refreshes.
+    super(
+      SessionNode.label(session),
+      session.runningAgents.length > 0
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : vscode.TreeItemCollapsibleState.None
+    );
     const s = session;
     // Salted with the provider's refresh revision ON PURPOSE: the native tree
     // restores selection/focus by id across refreshes, so a stable id kept the
@@ -88,6 +97,9 @@ export class SessionNode extends vscode.TreeItem {
 
   private static describe(s: Session): string {
     const bits: string[] = [relTime(s.mtimeMs)];
+    if (s.runningAgents.length > 0) {
+      bits.push(`${s.runningAgents.length} agent${s.runningAgents.length > 1 ? "s" : ""} running`);
+    }
     if (s.gitBranch) {
       bits.push(s.gitBranch);
     }
@@ -189,6 +201,29 @@ export class SessionNode extends vscode.TreeItem {
   }
 }
 
+// Indented child row under a session: one live subagent, purple sweeping dot.
+// Click opens the agent's raw sidechain log.
+export class AgentNode extends vscode.TreeItem {
+  constructor(agent: RunningAgent, iconsBase?: vscode.Uri) {
+    super(agent.description || agent.agentType, vscode.TreeItemCollapsibleState.None);
+    this.description = agent.description ? agent.agentType : relTime(agent.mtimeMs);
+    this.contextValue = "ccAgent";
+    this.iconPath = iconsBase
+      ? vscode.Uri.joinPath(iconsBase, "icons", "status-agents.svg")
+      : new vscode.ThemeIcon("robot", new vscode.ThemeColor("charts.purple"));
+    this.tooltip = new vscode.MarkdownString(
+      `**${agent.description || "(no description)"}**\n\n` +
+        `Type: \`${agent.agentType}\` · last write ${relTime(agent.mtimeMs)}\n\n` +
+        `\`${agent.filePath}\``
+    );
+    this.command = {
+      command: "vscode.open",
+      title: "Open Agent Log",
+      arguments: [vscode.Uri.file(agent.filePath)],
+    };
+  }
+}
+
 // A pinned "Usage" summary at the top of the tree.
 export class UsageNode extends vscode.TreeItem {
   constructor() {
@@ -210,7 +245,7 @@ export class StatNode extends vscode.TreeItem {
   }
 }
 
-type TreeNode = UsageNode | StatNode | ProjectNode | SessionNode;
+type TreeNode = UsageNode | StatNode | ProjectNode | SessionNode | AgentNode;
 export type SidebarStatusFilter = "all" | "active" | "awaiting" | "pendingReview" | "finished" | "interrupted" | "idle";
 
 export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
@@ -327,6 +362,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
               this.revision
             )
         );
+    }
+    if (element instanceof SessionNode) {
+      return element.session.runningAgents.map((a) => new AgentNode(a, element.iconsBase));
     }
     return [];
   }

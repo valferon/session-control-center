@@ -3,7 +3,14 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { computeStatus, lastActivityMs, parseSessionFile, SessionParser, StatusThresholds } from "../data/jsonlParser";
+import {
+  computeStatus,
+  lastActivityMs,
+  parseSessionFile,
+  probeSidechain,
+  SessionParser,
+  StatusThresholds,
+} from "../data/jsonlParser";
 
 const THRESHOLDS: StatusThresholds = { activeMs: 5 * 60_000, idleMs: 24 * 3_600_000 };
 
@@ -307,6 +314,63 @@ test("computeStatus matrix", () => {
   assert.equal(computeStatus(NOW - 30_000, { ...baseAgg, interrupted: true }, THRESHOLDS, NOW), "interrupted");
   // idle wins past the idle window
   assert.equal(computeStatus(NOW - 25 * 3_600_000, baseAgg, THRESHOLDS, NOW), "idle");
+});
+
+test("sidechain activity: background subagents keep a cleanly-ended session active", () => {
+  // clean end 10min ago, agent log written 30s ago -> still working
+  assert.equal(computeStatus(NOW - 10 * 60_000, baseAgg, THRESHOLDS, NOW, NOW - 30_000), "active");
+  // agent logs stale (older than activeMs) -> finished
+  assert.equal(computeStatus(NOW - 20 * 60_000, baseAgg, THRESHOLDS, NOW, NOW - 10 * 60_000), "finished");
+  // agent logs older than the conversation (foreground agents from an earlier
+  // turn) -> finished
+  assert.equal(computeStatus(NOW - 60_000, baseAgg, THRESHOLDS, NOW, NOW - 2 * 60_000), "finished");
+  // tool_use tail past the 30min grace but agents still writing -> active
+  // (long foreground workflow, previously flipped to interrupted)
+  assert.equal(
+    computeStatus(NOW - 40 * 60_000, { ...baseAgg, lastStopReason: "tool_use" }, THRESHOLDS, NOW, NOW - 10_000),
+    "active"
+  );
+  // awaiting-your-input still outranks running subagents
+  assert.equal(
+    computeStatus(NOW - 60_000, { ...baseAgg, awaitingInput: true }, THRESHOLDS, NOW, NOW - 10_000),
+    "awaiting"
+  );
+});
+
+test("probeSidechain: fresh agents are running, quiet/killed ones are not", async () => {
+  const now = Date.now();
+  const f = tmpFile([userPrompt(-10 * 60_000), assistantText(-9 * 60_000)]);
+  const sessionId = path.basename(f, ".jsonl");
+  const empty = await probeSidechain(f, sessionId, THRESHOLDS, now);
+  assert.equal(empty.newestMtimeMs, 0);
+  assert.deepEqual(empty.running, []);
+
+  const dir = path.join(path.dirname(f), sessionId, "subagents");
+  fs.mkdirSync(dir, { recursive: true });
+  // finished long ago: not running
+  fs.writeFileSync(path.join(dir, "agent-old.jsonl"), "{}\n");
+  const past = (now - 3_600_000) / 1000;
+  fs.utimesSync(path.join(dir, "agent-old.jsonl"), past, past);
+  // actively writing, with meta labels
+  fs.writeFileSync(path.join(dir, "agent-live.jsonl"), "{}\n");
+  fs.writeFileSync(
+    path.join(dir, "agent-live.meta.json"),
+    JSON.stringify({ agentType: "code-reviewer", description: "Review batch A", toolUseId: "t1" })
+  );
+  // fresh mtime but user-killed: excluded
+  fs.writeFileSync(path.join(dir, "agent-killed.jsonl"), "{}\n");
+  fs.writeFileSync(
+    path.join(dir, "agent-killed.meta.json"),
+    JSON.stringify({ agentType: "general-purpose", description: "Doomed", stoppedByUser: true })
+  );
+
+  const probe = await probeSidechain(f, sessionId, THRESHOLDS, now);
+  // newest spans ALL agent logs (incl. the killed one, written last here)
+  assert.ok(probe.newestMtimeMs >= fs.statSync(path.join(dir, "agent-live.jsonl")).mtimeMs);
+  assert.equal(probe.running.length, 1);
+  assert.equal(probe.running[0].id, "agent-live");
+  assert.equal(probe.running[0].agentType, "code-reviewer");
+  assert.equal(probe.running[0].description, "Review batch A");
 });
 
 // --- incremental parsing ---------------------------------------------------------

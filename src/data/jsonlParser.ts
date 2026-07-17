@@ -3,6 +3,7 @@ import * as path from "path";
 import {
   Aggregates,
   emptyAggregates,
+  RunningAgent,
   Session,
   SessionStatus,
   SubagentInfo,
@@ -378,6 +379,9 @@ export class SessionParser {
       sizeBytes,
       aggregates: agg,
       subagents,
+      // Live sidechain state is the store's business (status-time probe);
+      // a bare parse carries none.
+      runningAgents: [],
       costUsd,
     };
   }
@@ -450,7 +454,11 @@ export function computeStatus(
   lastActivityMs: number,
   agg: Pick<Aggregates, "lastConvRole" | "lastStopReason" | "awaitingInput" | "interrupted" | "queueDepth">,
   thresholds: StatusThresholds,
-  now: number
+  now: number,
+  // Newest mtime among the session's subagent sidechain logs (0 = none). NOT
+  // part of the cached aggregates: sidechains change without the main jsonl
+  // moving, so callers probe it fresh (probeSidechain) per evaluation.
+  sidechainActivityMs = 0
 ): SessionStatus {
   const age = now - lastActivityMs;
   // Stale: no conversational activity for longer than the idle window (default
@@ -468,6 +476,14 @@ export function computeStatus(
   if (agg.awaitingInput && agg.lastConvRole === "assistant") {
     return "awaiting";
   }
+  // Background subagents write ONLY their sidechain logs while the main jsonl
+  // sits at a clean turn end (the harness re-invokes the conversation via a
+  // task notification when they finish). A sidechain written more recently
+  // than the conversation, and recently in absolute terms, means work is still
+  // in flight — without this the session reads finished/pendingReview while
+  // its agents are visibly running.
+  const sidechainBusy =
+    sidechainActivityMs > lastActivityMs && now - sidechainActivityMs <= thresholds.activeMs;
   // A cleanly-ended turn = the last conversational record is an assistant
   // message with a terminal stop_reason. Anything else means the turn never
   // closed: a tool_use awaiting its result, a cut-off stream, an API error, or
@@ -478,31 +494,100 @@ export function computeStatus(
     FINISHED_STOP_REASONS.has(agg.lastStopReason);
   if (age <= thresholds.activeMs) {
     // Recent. A clean end normally means finished — EXCEPT when prompts are
-    // still queued: the harness is about to dequeue the next one, so the
-    // session is mid-flight, not "your move". Without this, every turn boundary
-    // of a queued-up session flashes pendingReview until the dequeue lands.
-    // Depth is only trusted while recent: if the harness were alive it would
-    // have dequeued within seconds, so an old positive depth is stale noise.
+    // still queued (the harness is about to dequeue the next one) or subagents
+    // are still writing: the session is mid-flight, not "your move". Without
+    // this, every turn boundary of a queued-up session flashes pendingReview
+    // until the dequeue lands. Depth is only trusted while recent: if the
+    // harness were alive it would have dequeued within seconds, so an old
+    // positive depth is stale noise.
     if (cleanEnd) {
-      return agg.queueDepth > 0 ? "active" : "finished";
+      return agg.queueDepth > 0 || sidechainBusy ? "active" : "finished";
     }
     // Dangling turn = still actively working (a tool is running / mid-stream).
     return "active";
   }
   if (cleanEnd) {
-    return "finished";
+    return sidechainBusy ? "active" : "finished";
   }
   // Dangling and quiet past activeMs. If the tail is an unanswered tool_use,
   // a tool is (very likely) still executing — tool calls append nothing while
   // they run, so silence here is normal. Stay active within the tool grace
-  // window instead of flapping to interrupted at activeMs.
+  // window instead of flapping to interrupted at activeMs. Freshly written
+  // sidechains extend the grace indefinitely: a foreground agent fan-out
+  // (workflows) legitimately runs for hours, and its sidechain writes prove
+  // the tool call is still alive.
   const toolInFlight = agg.lastConvRole === "assistant" && agg.lastStopReason === "tool_use";
-  if (toolInFlight && age <= Math.max(TOOL_RUNNING_GRACE_MS, thresholds.activeMs)) {
+  if (toolInFlight && (age <= Math.max(TOOL_RUNNING_GRACE_MS, thresholds.activeMs) || sidechainBusy)) {
     return "active";
   }
   // A dangling turn that truly stopped getting written: window died, API error,
   // or an ESC with no marker — incomplete, resumable.
   return "interrupted";
+}
+
+export interface SidechainProbe {
+  // Newest mtime among the session's agent-*.jsonl logs; 0 when none exist.
+  newestMtimeMs: number;
+  // Agents whose logs were written within the active window (and not marked
+  // stoppedByUser in their meta), newest first — "running right now".
+  running: RunningAgent[];
+}
+
+// Probe a session's subagent sidechain (<projectDir>/<sessionId>/subagents/).
+// Runs at STATUS time, not parse time: sidechains change while the main jsonl
+// (whose mtime+size keys the parse cache) doesn't move at all. Meta files are
+// read only for agents that look live — a handful of ~150-byte reads.
+export async function probeSidechain(
+  filePath: string,
+  sessionId: string,
+  thresholds: StatusThresholds,
+  now: number
+): Promise<SidechainProbe> {
+  const dir = path.join(path.dirname(filePath), sessionId, "subagents");
+  const none: SidechainProbe = { newestMtimeMs: 0, running: [] };
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(dir);
+  } catch {
+    return none;
+  }
+  let newest = 0;
+  const running: RunningAgent[] = [];
+  await Promise.all(
+    entries
+      .filter((e) => e.endsWith(".jsonl"))
+      .map(async (e) => {
+        const agentPath = path.join(dir, e);
+        let st: fs.Stats;
+        try {
+          st = await fs.promises.stat(agentPath);
+        } catch {
+          return; // agent log vanished mid-probe
+        }
+        if (st.mtimeMs > newest) {
+          newest = st.mtimeMs;
+        }
+        if (now - st.mtimeMs > thresholds.activeMs) {
+          return; // quiet: finished (or dead) agent
+        }
+        const id = path.basename(e, ".jsonl");
+        let agentType = "agent";
+        let description = "";
+        try {
+          const meta = JSON.parse(await fs.promises.readFile(path.join(dir, `${id}.meta.json`), "utf8"));
+          if (meta.stoppedByUser === true) {
+            return; // killed: fresh mtime is just the final flush
+          }
+          agentType = typeof meta.agentType === "string" && meta.agentType ? meta.agentType : agentType;
+          description = typeof meta.description === "string" ? meta.description : "";
+        } catch {
+          // no/corrupt meta: still show the agent, with placeholder labels
+        }
+        running.push({ id, agentType, description, filePath: agentPath, mtimeMs: st.mtimeMs });
+      })
+  );
+  running.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { newestMtimeMs: newest, running };
 }
 
 // Claude Code writes a synthetic user text block when a turn is aborted. The

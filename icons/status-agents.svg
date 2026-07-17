@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Purple dot sweeping left<->right along a faint track: a subagent
+       actively writing its sidechain log. Same motion as status-active.svg
+       (green, the session row) so "working" reads consistently; the purple
+       recolor marks it as an agent, not the conversation itself. -->
+  <line x1="2.5" y1="8" x2="13.5" y2="8" stroke="#a371f7" stroke-opacity="0.3" stroke-width="2" stroke-linecap="round"/>
+  <circle cy="8" r="3" fill="#a371f7">
+    <animate attributeName="cx" values="4;12;4" keyTimes="0;0.5;1" dur="1.2s"
+      calcMode="spline" keySplines="0.45 0 0.55 1;0.45 0 0.55 1" repeatCount="indefinite"/>
+  </circle>
+</svg>

@@ -43,6 +43,17 @@ export interface SubagentInfo {
   file: string;
 }
 
+// A subagent whose sidechain log is being actively written RIGHT NOW.
+// Computed at status time from <projectDir>/<sessionId>/subagents/ mtimes
+// (never cached — sidechains move while the main jsonl doesn't).
+export interface RunningAgent {
+  id: string; // "agent-<hex>" (log/meta basename without extension)
+  agentType: string;
+  description: string;
+  filePath: string; // absolute path of the agent's .jsonl log
+  mtimeMs: number;
+}
+
 export interface Aggregates {
   turns: number; // user-role records
   assistantTurns: number;
@@ -112,6 +123,9 @@ export interface Session {
   sizeBytes: number;
   aggregates: Aggregates;
   subagents: SubagentInfo[];
+  // Set by SessionStore when building the live Session (empty in cached
+  // entries — always overwritten at build time, never persisted meaningfully).
+  runningAgents: RunningAgent[];
   costUsd: number;
 }
 
