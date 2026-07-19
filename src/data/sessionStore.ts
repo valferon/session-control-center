@@ -135,7 +135,7 @@ export class SessionStore {
     thresholds: StatusThresholds
   ): Promise<SidechainProbe> {
     if (now - activityMs > thresholds.idleMs) {
-      return { newestMtimeMs: 0, running: [] };
+      return { newestMtimeMs: 0, running: [], workflows: [] };
     }
     return probeSidechain(filePath, sessionId, thresholds, now);
   }
@@ -282,6 +282,7 @@ export class SessionStore {
                   next.set(filePath, {
                     ...cached,
                     runningAgents: sidechain.running,
+                    runningWorkflows: sidechain.workflows,
                     status: this.finalStatus(
                       filePath,
                       computeStatus(activity, cached.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
@@ -317,6 +318,7 @@ export class SessionStore {
         next.set(filePath, {
           ...parsed,
           runningAgents: sidechain.running,
+          runningWorkflows: sidechain.workflows,
           status: this.finalStatus(
             filePath,
             computeStatus(activity, parsed.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
@@ -434,6 +436,7 @@ export class SessionStore {
       const session: Session = {
         ...cached,
         runningAgents: sidechain.running,
+        runningWorkflows: sidechain.workflows,
         status: this.finalStatus(
           filePath,
           computeStatus(activity, cached.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),
@@ -485,6 +488,7 @@ export class SessionStore {
       const session: Session = {
         ...parsed,
         runningAgents: sidechain.running,
+        runningWorkflows: sidechain.workflows,
         status: this.finalStatus(
           filePath,
           computeStatus(activity, parsed.aggregates, cfg.thresholds, now, sidechain.newestMtimeMs),

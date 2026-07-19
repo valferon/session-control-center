@@ -27,7 +27,9 @@ const CACHE_NAME = "session-cache.json";
 //     only for in-flight subtypes (away_summary et al. no longer move the
 //     watermark) and local-command echo user records no longer touch
 //     conversational state; discard v6 entries so endedAt/status re-derive.
-const CACHE_VERSION = 7 as const;
+// v8: aggregates gained `lastContextTokens` (live context occupancy for the
+//     sidebar indicator); discard v7 entries so it gets populated.
+const CACHE_VERSION = 8 as const;
 
 // Persisted per-session aggregate cache, keyed by file path + (mtime,size).
 // Lives in globalStorageUri so it survives reloads and is trivially nukable.

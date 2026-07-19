@@ -143,9 +143,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // tab; refresh the tree when the active tab changes so it tracks what you're
   // actually looking at. Keyed so tab events that don't move focus (e.g. a
   // background tab closing) don't trigger pointless re-renders.
-  let lastTabKey = activeTabKey();
+  let lastTabKey = activeTabKey(store.getProjectsDir());
   const onTabsChanged = () => {
-    const key = activeTabKey();
+    const key = activeTabKey(store.getProjectsDir());
     if (key !== lastTabKey) {
       lastTabKey = key;
       markFocusedSessionSeen();

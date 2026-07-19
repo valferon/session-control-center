@@ -373,6 +373,84 @@ test("probeSidechain: fresh agents are running, quiet/killed ones are not", asyn
   assert.equal(probe.running[0].description, "Review batch A");
 });
 
+test("probeSidechain: workflow agents one level deeper are found and grouped", async () => {
+  const now = Date.now();
+  const f = tmpFile([userPrompt(-10 * 60_000), assistantToolUse(-9 * 60_000, "Workflow", { stop: null })]);
+  const sessionId = path.basename(f, ".jsonl");
+  const sessionDir = path.join(path.dirname(f), sessionId);
+  const wfAgents = path.join(sessionDir, "subagents", "workflows", "wf_live1");
+  fs.mkdirSync(wfAgents, { recursive: true });
+  fs.writeFileSync(path.join(wfAgents, "agent-abc123.jsonl"), "{}\n");
+  fs.writeFileSync(path.join(wfAgents, "agent-abc123.meta.json"), JSON.stringify({ agentType: "workflow-subagent" }));
+  // run record: live status, per-agent label, current phase
+  fs.mkdirSync(path.join(sessionDir, "workflows"), { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionDir, "workflows", "wf_live1.json"),
+    JSON.stringify({
+      runId: "wf_live1",
+      workflowName: "bug-hunt",
+      status: "running",
+      agentCount: 7,
+      workflowProgress: [
+        { type: "workflow_phase", index: 1, title: "Find" },
+        { type: "workflow_phase", index: 2, title: "Verify" },
+        { type: "workflow_agent", agentId: "abc123", label: "verify:auth.ts", state: "running" },
+      ],
+    })
+  );
+
+  const probe = await probeSidechain(f, sessionId, THRESHOLDS, now);
+  // nested agent mtime counts toward the liveness watermark (the status fix)
+  assert.ok(probe.newestMtimeMs >= fs.statSync(path.join(wfAgents, "agent-abc123.jsonl")).mtimeMs);
+  assert.equal(probe.running.length, 0); // not mixed into loose agents
+  assert.equal(probe.workflows.length, 1);
+  const w = probe.workflows[0];
+  assert.equal(w.runId, "wf_live1");
+  assert.equal(w.name, "bug-hunt");
+  assert.equal(w.phase, "Verify");
+  assert.equal(w.agentCount, 7);
+  assert.equal(w.agents.length, 1);
+  assert.equal(w.agents[0].description, "verify:auth.ts"); // label joined from the run record
+  // the nested agent keeps a long-running workflow session out of "interrupted"
+  const agg = { ...baseAgg, lastStopReason: "tool_use" };
+  assert.equal(computeStatus(now - 40 * 60_000, agg, THRESHOLDS, now, probe.newestMtimeMs), "active");
+});
+
+test("probeSidechain: completed workflow run is not liveness (final flush ignored)", async () => {
+  const now = Date.now();
+  const f = tmpFile([userPrompt(-10 * 60_000), assistantText(-9 * 60_000)]);
+  const sessionId = path.basename(f, ".jsonl");
+  const sessionDir = path.join(path.dirname(f), sessionId);
+  const wfAgents = path.join(sessionDir, "subagents", "workflows", "wf_done1");
+  fs.mkdirSync(wfAgents, { recursive: true });
+  fs.writeFileSync(path.join(wfAgents, "agent-ddd.jsonl"), "{}\n"); // fresh mtime
+  fs.mkdirSync(path.join(sessionDir, "workflows"), { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionDir, "workflows", "wf_done1.json"),
+    JSON.stringify({ runId: "wf_done1", workflowName: "done-wf", status: "completed" })
+  );
+
+  const probe = await probeSidechain(f, sessionId, THRESHOLDS, now);
+  assert.equal(probe.workflows.length, 0);
+  assert.equal(probe.newestMtimeMs, 0); // completed run's flush is not activity
+});
+
+test("probeSidechain: workflow with no run record yet is treated as live", async () => {
+  const now = Date.now();
+  const f = tmpFile([userPrompt(-10 * 60_000), assistantText(-9 * 60_000)]);
+  const sessionId = path.basename(f, ".jsonl");
+  const wfAgents = path.join(path.dirname(f), sessionId, "subagents", "workflows", "wf_norec");
+  fs.mkdirSync(wfAgents, { recursive: true });
+  fs.writeFileSync(path.join(wfAgents, "agent-eee.jsonl"), "{}\n");
+
+  const probe = await probeSidechain(f, sessionId, THRESHOLDS, now);
+  assert.equal(probe.workflows.length, 1);
+  assert.equal(probe.workflows[0].runId, "wf_norec");
+  assert.equal(probe.workflows[0].name, undefined);
+  assert.equal(probe.workflows[0].agents.length, 1);
+  assert.ok(probe.newestMtimeMs > 0);
+});
+
 // --- incremental parsing ---------------------------------------------------------
 
 test("incremental feeds equal a full parse", async () => {
@@ -447,6 +525,21 @@ test("multi-line assistant message shares one usage object — counted once", as
   assert.equal(s.aggregates.tokens.inputTokens, 10 + 0); // tool-use line counted once (builder default 10)
   assert.equal(s.aggregates.toolCalls, 1);
   assert.equal(s.aggregates.assistantTurns, 2);
+});
+
+test("lastContextTokens reflects the LAST usage-bearing call; zero-usage records don't wipe it", async () => {
+  const s = await parse([
+    userPrompt(-20 * 60_000),
+    assistantText(-19 * 60_000, { id: "m1", usage: { input_tokens: 100, output_tokens: 50 } }),
+    userPrompt(-10 * 60_000),
+    assistantText(-9 * 60_000, {
+      id: "m2",
+      usage: { input_tokens: 50_000, output_tokens: 500, cache_read_input_tokens: 100_000 },
+    }),
+    // synthetic placeholder: all-zero usage must not reset the indicator
+    assistantText(-8 * 60_000, { id: "m3", usage: { input_tokens: 0, output_tokens: 0 } }),
+  ]);
+  assert.equal(s.aggregates.lastContextTokens, 150_500);
 });
 
 test("lastActivityMs prefers endedAt over mtime", async () => {

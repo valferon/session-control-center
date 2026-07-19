@@ -1,11 +1,11 @@
 import * as vscode from "vscode";
-import { ProjectGroup, RunningAgent, Session, SessionStatus, UsageWindow } from "../model/types";
+import { ProjectGroup, RunningAgent, RunningWorkflow, Session, SessionStatus, UsageWindow } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
 import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
 import { SeenStore } from "../data/seenStore";
 import { readModelSettings } from "../data/paths";
-import { findActiveClaudeSession } from "../util/activeClaudeTab";
+import { findSessionForActiveTab } from "../util/activeClaudeTab";
 import { projectUri, WindowRepoDecorations } from "./sessionDecorations";
 
 export class ProjectNode extends vscode.TreeItem {
@@ -15,7 +15,9 @@ export class ProjectNode extends vscode.TreeItem {
     // Tag for the FileDecorationProvider so this window can tint its own
     // repo's row (custom scheme — not a real file, never opened).
     this.resourceUri = projectUri(group.key);
-    const parts = [`${group.sessions.length} sessions`];
+    // Compact: count first, then only the nonzero states in short words —
+    // long descriptions get clipped by the sidebar before the useful bits.
+    const parts = [`${group.sessions.length}`];
     if (group.activeCount > 0) {
       parts.push(`${group.activeCount} active`);
     }
@@ -23,10 +25,10 @@ export class ProjectNode extends vscode.TreeItem {
       parts.push(`${group.awaitingCount} awaiting`);
     }
     if (group.pendingReviewCount > 0) {
-      parts.push(`${group.pendingReviewCount} to review`);
+      parts.push(`${group.pendingReviewCount} review`);
     }
     if (group.finishedCount > 0) {
-      parts.push(`${group.finishedCount} finished`);
+      parts.push(`${group.finishedCount} done`);
     }
     this.description = parts.join(" · ");
     // Namespaced so other extensions' menus (e.g. Mermaid's "Add Diagram",
@@ -48,13 +50,14 @@ export class SessionNode extends vscode.TreeItem {
     public readonly iconsBase?: vscode.Uri,
     revision = 0
   ) {
-    // Sessions are leaves EXCEPT while subagents are running: those get an
-    // indented child row per live agent. Expanded (not Collapsed) because the
-    // whole point is seeing them without a click; the id is revision-salted
-    // anyway, so VS Code can't persist a manual collapse across refreshes.
+    // Sessions are leaves EXCEPT while subagents or workflows are running:
+    // those get an indented child row per live agent / workflow run. Expanded
+    // (not Collapsed) because the whole point is seeing them without a click;
+    // the id is revision-salted anyway, so VS Code can't persist a manual
+    // collapse across refreshes.
     super(
       SessionNode.label(session),
-      session.runningAgents.length > 0
+      session.runningAgents.length > 0 || session.runningWorkflows.length > 0
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.None
     );
@@ -95,20 +98,18 @@ export class SessionNode extends vscode.TreeItem {
     return max > 0 ? truncate(raw, max) : raw;
   }
 
+  // Deliberately minimal — time and live agents only. Branch, model and
+  // context size live in the tooltip and, for the focused session, in the
+  // "Current session" section at the top of the tree; putting them on every
+  // row just got clipped by the sidebar width.
   private static describe(s: Session): string {
     const bits: string[] = [relTime(s.mtimeMs)];
-    if (s.runningAgents.length > 0) {
-      bits.push(`${s.runningAgents.length} agent${s.runningAgents.length > 1 ? "s" : ""} running`);
-    }
-    if (s.gitBranch) {
-      bits.push(s.gitBranch);
-    }
-    // Per-session model, so it's clear the usage panel's "default model" stat
-    // is a window default, not what every session runs on. lastModel first:
-    // it tracks a mid-session /model switch; models[0] is most-used and lags.
-    const model = shortModel(s.aggregates.lastModel ? [s.aggregates.lastModel] : s.aggregates.models);
-    if (model) {
-      bits.push(model);
+    // One count covering loose agents AND workflow agents — the tree below
+    // the row shows the split.
+    const live =
+      s.runningAgents.length + s.runningWorkflows.reduce((n, w) => n + w.agents.length, 0);
+    if (live > 0) {
+      bits.push(`${live}⚡`);
     }
     return bits.join(" · ");
   }
@@ -187,6 +188,14 @@ export class SessionNode extends vscode.TreeItem {
       : a.models.join(", ") || "?";
     md.appendMarkdown(`Model: ${modelLine} · Turns: ${a.turns} · Tools: ${a.toolCalls}\n\n`);
     md.appendMarkdown(`Tokens: ${fmtNum(total)} · ~$${s.costUsd.toFixed(2)}\n\n`);
+    if (a.lastContextTokens > 0) {
+      md.appendMarkdown(
+        `Context now: ~${fmtNum(a.lastContextTokens)} tokens (last call)` +
+          (a.lastContextTokens >= CTX_WARN_TOKENS
+            ? ` — **large**: sessions past ${fmtNum(CTX_WARN_TOKENS)} cost noticeably more per turn; consider /compact or /clear before the next task\n\n`
+            : `\n\n`)
+      );
+    }
     if (a.filesTouched > 0) {
       md.appendMarkdown(`Files touched: ${a.filesTouched}\n\n`);
     }
@@ -196,8 +205,53 @@ export class SessionNode extends vscode.TreeItem {
     if (a.hasSidechain || s.subagents.length > 0) {
       md.appendMarkdown(`Subagents: ${s.subagents.length || "yes"}\n\n`);
     }
+    for (const w of s.runningWorkflows) {
+      md.appendMarkdown(
+        `Workflow: **${w.name ?? w.runId}** — ${w.agents.length} agent${w.agents.length === 1 ? "" : "s"} running` +
+          (w.phase ? ` · ${w.phase}` : "") +
+          `\n\n`
+      );
+    }
     md.appendMarkdown(`Session: \`${s.sessionId}\``);
     return md;
+  }
+}
+
+// Indented child row under a session: one live Workflow-tool run, grouping
+// its agents. Click opens the run record json (progress, results, script path).
+export class WorkflowNode extends vscode.TreeItem {
+  constructor(
+    public readonly workflow: RunningWorkflow,
+    public readonly iconsBase?: vscode.Uri
+  ) {
+    // Expanded for the same reason session rows with agents are: the point is
+    // seeing the fan-out without a click.
+    super(workflow.name ?? workflow.runId, vscode.TreeItemCollapsibleState.Expanded);
+    const w = workflow;
+    const bits = [`${w.agents.length}⚡`];
+    if (w.phase) {
+      bits.push(w.phase);
+    }
+    if (w.agentCount) {
+      bits.push(`${w.agentCount} spawned`);
+    }
+    this.description = bits.join(" · ");
+    this.contextValue = "ccWorkflow";
+    this.iconPath = new vscode.ThemeIcon("type-hierarchy-sub", new vscode.ThemeColor("charts.purple"));
+    this.tooltip = new vscode.MarkdownString(
+      `**Workflow ${w.name ?? ""}** \`${w.runId}\`\n\n` +
+        (w.phase ? `Phase: ${w.phase}\n\n` : "") +
+        `${w.agents.length} agent${w.agents.length === 1 ? "" : "s"} writing now` +
+        (w.agentCount ? ` · ${w.agentCount} spawned over the run` : "") +
+        `\n\nLast write ${relTime(w.newestMtimeMs)}`
+    );
+    if (w.jsonPath) {
+      this.command = {
+        command: "vscode.open",
+        title: "Open Workflow Run Record",
+        arguments: [vscode.Uri.file(w.jsonPath)],
+      };
+    }
   }
 }
 
@@ -233,6 +287,17 @@ export class UsageNode extends vscode.TreeItem {
   }
 }
 
+// Pinned section for the session shown in the focused Claude tab: the
+// per-session detail (model, branch, context) that used to crowd every row.
+export class FocusedNode extends vscode.TreeItem {
+  constructor(public readonly session: Session) {
+    super("Current session", vscode.TreeItemCollapsibleState.Expanded);
+    this.description = truncate(session.title ?? session.sessionId.slice(0, 8), 30);
+    this.contextValue = "ccFocused";
+    this.iconPath = new vscode.ThemeIcon("target");
+  }
+}
+
 export class StatNode extends vscode.TreeItem {
   constructor(label: string, value: string, icon: string, color?: string, command?: vscode.Command) {
     super(value, vscode.TreeItemCollapsibleState.None);
@@ -245,7 +310,7 @@ export class StatNode extends vscode.TreeItem {
   }
 }
 
-type TreeNode = UsageNode | StatNode | ProjectNode | SessionNode | AgentNode;
+type TreeNode = UsageNode | FocusedNode | StatNode | ProjectNode | SessionNode | WorkflowNode | AgentNode;
 export type SidebarStatusFilter = "all" | "active" | "awaiting" | "pendingReview" | "finished" | "interrupted" | "idle";
 
 export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
@@ -345,10 +410,17 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         .map((g) => this.filtered(g))
         .filter((g): g is ProjectGroup => g !== undefined)
         .map((g) => new ProjectNode(g));
-      return [new UsageNode(), ...projects];
+      // "Current session" only when the focused editor tab resolves to a
+      // known session — the Claude panel (best-effort title join) or one of
+      // the session's own files (agent log / workflow record, exact by path).
+      const focused = findSessionForActiveTab(this.store);
+      return [new UsageNode(), ...(focused ? [new FocusedNode(focused)] : []), ...projects];
     }
     if (element instanceof UsageNode) {
       return this.usageStats();
+    }
+    if (element instanceof FocusedNode) {
+      return this.focusedStats(element.session);
     }
     if (element instanceof ProjectNode) {
       return element.group.sessions
@@ -364,7 +436,14 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         );
     }
     if (element instanceof SessionNode) {
-      return element.session.runningAgents.map((a) => new AgentNode(a, element.iconsBase));
+      // Workflow fan-outs first (grouped), then loose Agent-tool agents.
+      return [
+        ...element.session.runningWorkflows.map((w) => new WorkflowNode(w, element.iconsBase)),
+        ...element.session.runningAgents.map((a) => new AgentNode(a, element.iconsBase)),
+      ];
+    }
+    if (element instanceof WorkflowNode) {
+      return element.workflow.agents.map((a) => new AgentNode(a, element.iconsBase));
     }
     return [];
   }
@@ -434,29 +513,15 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     }
     }
 
-    // Model of the session you're LOOKING AT (focused Claude tab), when one can
-    // be identified — this row follows tab focus, so it always describes the
-    // conversation on screen. lastModel = model of the newest assistant message,
-    // so a mid-session /model switch shows up immediately.
-    const setModelCmd: vscode.Command = {
-      command: "claudeControlCenter.setModel",
-      title: "Set Claude Model",
-    };
-    const active = findActiveClaudeSession(this.store);
-    const activeModel = active && (active.aggregates.lastModel ?? active.aggregates.models[0]);
-    if (active && activeModel) {
-      const n = new StatNode("model (focused session)", shortModel([activeModel]), "chip", "charts.green", setModelCmd);
-      n.tooltip =
-        `Model of the focused Claude tab ("${active.title ?? active.sessionId.slice(0, 8)}"): ${activeModel}. ` +
-        "Change a RUNNING session's model with /model inside it; click to change the default for new conversations.";
-      nodes.push(n);
-    }
-
     // Currently selected model + reasoning effort (from settings.json). This is
     // the WINDOW's default for new conversations — NOT per-session; each session
     // row shows its own model in its description/tooltip. There is no API to
     // set the model of an existing session from outside Claude Code; use
     // /model inside the conversation.
+    const setModelCmd: vscode.Command = {
+      command: "claudeControlCenter.setModel",
+      title: "Set Claude Model",
+    };
     const sel = readModelSettings(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
     if (sel.model) {
       const n = new StatNode("default model (new sessions)", sel.model, "chip", "charts.blue", setModelCmd);
@@ -484,6 +549,50 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     }
     if (m.finishedSessions > 0) {
       nodes.push(new StatNode("finished", String(m.finishedSessions), "pass", "charts.purple"));
+    }
+    return nodes;
+  }
+
+  // Detail rows for the focused tab's session — model, branch, live context.
+  // This is where the per-row clutter moved: one place, only for the session
+  // you're actually looking at.
+  private focusedStats(s: Session): StatNode[] {
+    const nodes: StatNode[] = [];
+    const a = s.aggregates;
+
+    const model = a.lastModel ?? a.models[0];
+    if (model) {
+      const n = new StatNode("model", shortModel([model]), "chip", "charts.green", {
+        command: "claudeControlCenter.setModel",
+        title: "Set Claude Model",
+      });
+      n.tooltip =
+        `${model} — model of the focused Claude tab. Change a RUNNING session's model ` +
+        "with /model inside it; click to change the default for new conversations.";
+      nodes.push(n);
+    }
+
+    if (s.gitBranch) {
+      nodes.push(new StatNode("branch", s.gitBranch, "git-branch"));
+    }
+
+    const ctx = a.lastContextTokens;
+    if (ctx > 0) {
+      const color =
+        ctx >= CTX_WARN_TOKENS ? "charts.red" : ctx >= CTX_WARN_TOKENS * 0.66 ? "charts.yellow" : "charts.green";
+      const n = new StatNode("context", `${fmtNum(ctx)} tokens`, "layers", color);
+      n.tooltip =
+        `Live context of this session (last call's prompt + output). ` +
+        (ctx >= CTX_WARN_TOKENS
+          ? `Past ${fmtNum(CTX_WARN_TOKENS)} every turn costs noticeably more — /compact or /clear before the next task.`
+          : `Sessions past ${fmtNum(CTX_WARN_TOKENS)} land in the expensive bucket; /compact between tasks keeps this down.`);
+      nodes.push(n);
+    }
+
+    const t = a.tokens;
+    const total = t.inputTokens + t.outputTokens + t.cacheCreationInputTokens + t.cacheReadInputTokens;
+    if (total > 0) {
+      nodes.push(new StatNode("total spend", `${fmtNum(total)} · ~$${s.costUsd.toFixed(2)}`, "flame"));
     }
     return nodes;
   }
@@ -545,22 +654,28 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   }
 }
 
+// Context size where a session lands in the usage panel's ">150k context"
+// bucket — the point where per-turn cost climbs even with caching.
+const CTX_WARN_TOKENS = 150_000;
+
+// Compact by design ("2h", not "2h ago") — session rows have ~30 chars of
+// description before the sidebar clips them.
 function relTime(ms: number): string {
   const diff = Date.now() - ms;
   const s = Math.floor(diff / 1000);
   if (s < 60) {
-    return `${s}s ago`;
+    return `${s}s`;
   }
   const m = Math.floor(s / 60);
   if (m < 60) {
-    return `${m}m ago`;
+    return `${m}m`;
   }
   const h = Math.floor(m / 60);
   if (h < 24) {
-    return `${h}h ago`;
+    return `${h}h`;
   }
   const d = Math.floor(h / 24);
-  return `${d}d ago`;
+  return `${d}d`;
 }
 
 function truncate(s: string, n: number): string {

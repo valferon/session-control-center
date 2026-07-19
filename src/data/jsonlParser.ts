@@ -4,6 +4,7 @@ import {
   Aggregates,
   emptyAggregates,
   RunningAgent,
+  RunningWorkflow,
   Session,
   SessionStatus,
   SubagentInfo,
@@ -196,6 +197,17 @@ export class SessionParser {
             agg.tokens.outputTokens += num(u.output_tokens);
             agg.tokens.cacheCreationInputTokens += num(u.cache_creation_input_tokens);
             agg.tokens.cacheReadInputTokens += num(u.cache_read_input_tokens);
+            // Live context = the latest call's full prompt + its output.
+            // Last-write-wins across usage-bearing records; zero-usage
+            // records (synthetic placeholders) must not wipe it.
+            const ctx =
+              num(u.input_tokens) +
+              num(u.cache_read_input_tokens) +
+              num(u.cache_creation_input_tokens) +
+              num(u.output_tokens);
+            if (ctx > 0) {
+              agg.lastContextTokens = ctx;
+            }
           }
           // Skip the placeholder "<synthetic>" model (zero-usage, never selected).
           if (typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
@@ -382,6 +394,7 @@ export class SessionParser {
       // Live sidechain state is the store's business (status-time probe);
       // a bare parse carries none.
       runningAgents: [],
+      runningWorkflows: [],
       costUsd,
     };
   }
@@ -526,30 +539,103 @@ export function computeStatus(
 }
 
 export interface SidechainProbe {
-  // Newest mtime among the session's agent-*.jsonl logs; 0 when none exist.
+  // Newest mtime among the session's agent-*.jsonl logs (Agent-tool AND live
+  // workflow runs); 0 when none exist.
   newestMtimeMs: number;
   // Agents whose logs were written within the active window (and not marked
   // stoppedByUser in their meta), newest first — "running right now".
+  // Workflow agents are NOT in here; they're grouped under `workflows`.
   running: RunningAgent[];
+  // Workflow-tool runs with agents writing within the active window,
+  // newest first.
+  workflows: RunningWorkflow[];
 }
 
 // Probe a session's subagent sidechain (<projectDir>/<sessionId>/subagents/).
 // Runs at STATUS time, not parse time: sidechains change while the main jsonl
 // (whose mtime+size keys the parse cache) doesn't move at all. Meta files are
 // read only for agents that look live — a handful of ~150-byte reads.
+//
+// Workflow-tool agents live ONE LEVEL DEEPER than Agent-tool ones:
+// <sessionId>/subagents/workflows/<runId>/agent-*.jsonl. A flat readdir missed
+// them entirely, so a workflow past the tool grace window flipped its session
+// to "interrupted" while dozens of agents were still writing.
 export async function probeSidechain(
   filePath: string,
   sessionId: string,
   thresholds: StatusThresholds,
   now: number
 ): Promise<SidechainProbe> {
-  const dir = path.join(path.dirname(filePath), sessionId, "subagents");
-  const none: SidechainProbe = { newestMtimeMs: 0, running: [] };
+  const sessionDir = path.join(path.dirname(filePath), sessionId);
+  const dir = path.join(sessionDir, "subagents");
+  const top = await scanAgentDir(dir, thresholds, now);
+  let newest = top.newestMtimeMs;
+  const workflows: RunningWorkflow[] = [];
+
+  let runIds: string[] = [];
+  try {
+    runIds = await fs.promises.readdir(path.join(dir, "workflows"));
+  } catch {
+    // no workflows subdir — the common case
+  }
+  await Promise.all(
+    runIds.map(async (runId) => {
+      const scan = await scanAgentDir(path.join(dir, "workflows", runId), thresholds, now);
+      if (scan.newestMtimeMs === 0) {
+        return; // empty run dir
+      }
+      // The sibling run record knows the run's fate. A terminal run's fresh
+      // agent mtimes are just the final flush — counting them as liveness
+      // would hold the session "active" for a whole activeMs window after the
+      // workflow finished. Missing/unreadable record = assume live (older
+      // harnesses may write it only at completion).
+      const rec = await readWorkflowRecord(path.join(sessionDir, "workflows", `${runId}.json`));
+      if (rec && TERMINAL_WORKFLOW_STATUSES.has(rec.status ?? "")) {
+        return;
+      }
+      if (scan.newestMtimeMs > newest) {
+        newest = scan.newestMtimeMs;
+      }
+      if (scan.running.length === 0) {
+        return; // agents all quiet: nothing to show (newest still counted above)
+      }
+      // Workflow agent metas carry no description; the run record's progress
+      // entries do (per-agent labels like "verify:auth.ts").
+      for (const a of scan.running) {
+        const label = rec?.labels.get(a.id.replace(/^agent-/, ""));
+        if (label && !a.description) {
+          a.description = label;
+        }
+      }
+      workflows.push({
+        runId,
+        name: rec?.name,
+        status: rec?.status,
+        phase: rec?.phase,
+        agentCount: rec?.agentCount,
+        newestMtimeMs: scan.newestMtimeMs,
+        agents: scan.running,
+        jsonPath: rec?.jsonPath,
+      });
+    })
+  );
+  workflows.sort((a, b) => b.newestMtimeMs - a.newestMtimeMs);
+  return { newestMtimeMs: newest, running: top.running, workflows };
+}
+
+// One flat directory of agent-*.jsonl logs (+ optional *.meta.json): newest
+// mtime across ALL logs, plus the agents still writing within the active
+// window, newest first.
+async function scanAgentDir(
+  dir: string,
+  thresholds: StatusThresholds,
+  now: number
+): Promise<{ newestMtimeMs: number; running: RunningAgent[] }> {
   let entries: string[];
   try {
     entries = await fs.promises.readdir(dir);
   } catch {
-    return none;
+    return { newestMtimeMs: 0, running: [] };
   }
   let newest = 0;
   const running: RunningAgent[] = [];
@@ -588,6 +674,54 @@ export async function probeSidechain(
   );
   running.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return { newestMtimeMs: newest, running };
+}
+
+// Run-record statuses that mean "over": agents may have flushed a moment ago,
+// but nothing is running. Unknown/missing statuses are treated as live —
+// worst case is a stale node that ages out with the active window.
+const TERMINAL_WORKFLOW_STATUSES = new Set(["completed", "failed", "error", "cancelled", "killed", "stopped"]);
+
+interface WorkflowRecord {
+  jsonPath: string;
+  name?: string;
+  status?: string;
+  phase?: string;
+  agentCount?: number;
+  labels: Map<string, string>; // agentId (no "agent-" prefix) -> progress label
+}
+
+// Best-effort read of a Workflow run record (<sessionId>/workflows/<runId>.json).
+// Can be a few hundred KB (embeds the script and result) — read only for runs
+// whose agent dir shows recent writes.
+async function readWorkflowRecord(jsonPath: string): Promise<WorkflowRecord | undefined> {
+  let rec: any;
+  try {
+    rec = JSON.parse(await fs.promises.readFile(jsonPath, "utf8"));
+  } catch {
+    return undefined; // not written yet, or torn mid-write — retry next probe
+  }
+  const labels = new Map<string, string>();
+  let phase: string | undefined;
+  if (Array.isArray(rec.workflowProgress)) {
+    for (const p of rec.workflowProgress) {
+      if (!p || typeof p !== "object") {
+        continue;
+      }
+      if (p.type === "workflow_phase" && typeof p.title === "string") {
+        phase = p.title; // last one wins = current phase
+      } else if (p.type === "workflow_agent" && typeof p.agentId === "string" && typeof p.label === "string") {
+        labels.set(p.agentId, p.label);
+      }
+    }
+  }
+  return {
+    jsonPath,
+    name: typeof rec.workflowName === "string" && rec.workflowName ? rec.workflowName : undefined,
+    status: typeof rec.status === "string" ? rec.status : undefined,
+    phase,
+    agentCount: typeof rec.agentCount === "number" ? rec.agentCount : undefined,
+    labels,
+  };
 }
 
 // Claude Code writes a synthetic user text block when a turn is aborted. The

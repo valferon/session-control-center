@@ -54,6 +54,22 @@ export interface RunningAgent {
   mtimeMs: number;
 }
 
+// A Workflow-tool run whose agents are writing RIGHT NOW. Workflow agents
+// live one level deeper than Agent-tool ones
+// (<sessionId>/subagents/workflows/<runId>/agent-*.jsonl); the sibling run
+// record (<sessionId>/workflows/<runId>.json) supplies name/status/progress
+// when readable. Like RunningAgent: computed at status time, never cached.
+export interface RunningWorkflow {
+  runId: string; // "wf_<hex>"
+  name?: string; // meta.name from the run record
+  status?: string; // run-record status ("running"/"completed"/…) when known
+  phase?: string; // latest phase title from workflowProgress
+  agentCount?: number; // total agents spawned over the run's lifetime
+  newestMtimeMs: number; // newest mtime among this run's agent logs
+  agents: RunningAgent[]; // agents writing within the active window, newest first
+  jsonPath?: string; // run-record path, when it exists (click-to-open target)
+}
+
 export interface Aggregates {
   turns: number; // user-role records
   assistantTurns: number;
@@ -71,6 +87,12 @@ export interface Aggregates {
   // models[] is most-used-first (drives cost rate) and goes stale after a
   // mid-session /model switch until the new model dominates; this doesn't.
   lastModel?: string;
+  // Context occupancy after the most recent assistant API call: that call's
+  // input + cache_read + cache_creation + output tokens. Approximates what the
+  // NEXT request will carry — the number the usage panel's ">150k context"
+  // bucket is about. Sum-of-session tokens (tokens field) measures spend, not
+  // context; this measures the live window. Drops after /compact or /clear.
+  lastContextTokens: number;
   startedAt?: string;
   endedAt?: string;
   filesTouched: number;
@@ -99,6 +121,7 @@ export function emptyAggregates(): Aggregates {
     toolCharsByName: {},
     tokens: emptyTokens(),
     models: [],
+    lastContextTokens: 0,
     queueDepth: 0,
     filesTouched: 0,
     prLinks: [],
@@ -126,6 +149,8 @@ export interface Session {
   // Set by SessionStore when building the live Session (empty in cached
   // entries — always overwritten at build time, never persisted meaningfully).
   runningAgents: RunningAgent[];
+  // Live Workflow-tool runs, same lifecycle as runningAgents.
+  runningWorkflows: RunningWorkflow[];
   costUsd: number;
 }
 

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { Session } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
 
@@ -6,6 +7,50 @@ import { SessionStore } from "../data/sessionStore";
 // sessionActions.revealExistingClaudeTab — a webview tab exposes no session id,
 // so the tab LABEL vs session TITLE is the only join key available).
 const CLAUDE_PANEL_VIEW_TYPE = "claudeVSCodePanel";
+
+// Session for the focused tab, for DISPLAY purposes (the "Current session"
+// tree section): a Claude conversation panel (title join, below) — or a text
+// tab showing one of the session's own files (main jsonl, agent sidechain
+// log, workflow run record), whose path carries the session id and so
+// resolves deterministically. Clicking an agent/workflow row opens exactly
+// such a file; without this branch the section vanished the moment you looked
+// at what an agent was doing.
+//
+// NOT used by the auto-mark-reviewed path (extension.ts): peeking at a raw
+// sidechain log is not reviewing the conversation, and must not flip a
+// pendingReview session to reviewed. That path stays on
+// findActiveClaudeSession (webview tabs only).
+export function findSessionForActiveTab(store: SessionStore): Session | undefined {
+  const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+  if (input instanceof vscode.TabInputText) {
+    return sessionFromLogPath(input.uri.fsPath, store);
+  }
+  return findActiveClaudeSession(store);
+}
+
+// Resolve a file under the projects dir to its session. Path shapes:
+//   <root>/<encodedDir>/<sessionId>.jsonl                          (main log)
+//   <root>/<encodedDir>/<sessionId>/subagents/agent-*.jsonl        (agent log)
+//   <root>/<encodedDir>/<sessionId>/subagents/workflows/<run>/...  (wf agent)
+//   <root>/<encodedDir>/<sessionId>/workflows/<run>.json           (run record)
+function sessionFromLogPath(fsPath: string, store: SessionStore): Session | undefined {
+  const root = normPath(store.getProjectsDir());
+  const p = normPath(fsPath);
+  if (!p.startsWith(root + path.sep)) {
+    return undefined;
+  }
+  const segs = p.slice(root.length + 1).split(path.sep);
+  if (segs.length < 2) {
+    return undefined;
+  }
+  const sessionId =
+    segs.length === 2
+      ? segs[1].endsWith(".jsonl")
+        ? segs[1].slice(0, -".jsonl".length)
+        : undefined
+      : segs[1];
+  return sessionId ? store.getSession(sessionId) : undefined;
+}
 
 // The session shown in the currently focused editor tab, if that tab is a
 // Claude conversation panel whose label matches a known session title.
@@ -95,10 +140,20 @@ function pathRelated(a: string, b: string): boolean {
 }
 
 // Stable key of the active tab, used to skip refreshes when tab focus events
-// fire without the active tab actually changing.
-export function activeTabKey(): string {
+// fire without the active tab actually changing. Text tabs key only when the
+// file lives under the projects dir (a session/agent/workflow file the
+// "Current session" section follows); switching between ordinary editors
+// keeps the "" key and triggers no tree re-render.
+export function activeTabKey(projectsDir?: string): string {
   const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
   const input = tab?.input;
+  if (input instanceof vscode.TabInputText) {
+    const p = normPath(input.uri.fsPath);
+    if (projectsDir && p.startsWith(normPath(projectsDir) + path.sep)) {
+      return `text|${p}`;
+    }
+    return "";
+  }
   if (!(input instanceof vscode.TabInputWebview)) {
     return "";
   }
