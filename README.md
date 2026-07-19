@@ -8,6 +8,8 @@ repo, so you can context switch without leaving the editor.
 > or supported by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic;
 > they are used here only to describe what the extension works with.
 
+![Sidebar: plan usage, focused-session details, live sessions per repo](media/sidebar.png)
+
 ## Privacy and data handling
 
 - **Fully local by default.** The extension reads `~/.claude/projects/*/*.jsonl`
