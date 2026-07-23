@@ -314,6 +314,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, 800);
   }
 
+  // One-time first-run offer to turn on the opt-in usage panel. It stays off
+  // by default (privacy: reads the local OAuth token, calls Anthropic's usage
+  // endpoint), so without this prompt most users never discover the setting.
+  void offerUsageOptIn(context);
+
   // If we just opened this window to reopen a session from another repo, do it.
   void consumePendingOpenSession(context);
 
@@ -333,6 +338,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     })
   );
+}
+
+// Ask once, right after install, whether to enable the subscription-usage
+// panel. The globalState flag makes this once-ever across all windows; already
+// having it on (e.g. settings sync) also counts as answered.
+async function offerUsageOptIn(context: vscode.ExtensionContext): Promise<void> {
+  const PROMPT_KEY = "usageOptInPrompted";
+  if (context.globalState.get<boolean>(PROMPT_KEY)) {
+    return;
+  }
+  const config = vscode.workspace.getConfiguration("claudeControlCenter");
+  if (config.get<boolean>("usage.enabled", false)) {
+    await context.globalState.update(PROMPT_KEY, true);
+    return;
+  }
+  await context.globalState.update(PROMPT_KEY, true);
+  const ENABLE = "Enable";
+  const pick = await vscode.window.showInformationMessage(
+    "Show your Claude subscription usage (5h/weekly windows) in the sidebar? " +
+      "This reads your local Claude OAuth token and sends it only to api.anthropic.com " +
+      "to fetch the same data as the /usage command. Off by default; you can change " +
+      "this anytime via the claudeControlCenter.usage.enabled setting.",
+    ENABLE,
+    "No thanks"
+  );
+  if (pick === ENABLE) {
+    await config.update("usage.enabled", true, vscode.ConfigurationTarget.Global);
+    // The onDidChangeConfiguration listener picks this up and fetches now.
+  }
 }
 
 // Change the default model for NEW Claude conversations by writing the `model`
