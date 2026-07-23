@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ProjectGroup, RunningAgent, RunningWorkflow, Session, SessionStatus, UsageWindow } from "../model/types";
+import { ProjectGroup, RunningAgent, RunningWorkflow, Session, UsageWindow } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
 import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
@@ -79,7 +79,7 @@ export class SessionNode extends vscode.TreeItem {
       `session-${s.status}` + (s.cwd ? "" : "-nocwd") + (archived ? "-archived" : "");
     this.iconPath = archived
       ? new vscode.ThemeIcon("archive", new vscode.ThemeColor("disabledForeground"))
-      : SessionNode.icon(s.status, iconsBase);
+      : SessionNode.icon(s, iconsBase);
     this.tooltip = SessionNode.tooltip(s);
     // Default click: smart open — opens the repo, or starts Claude if you're
     // already in that repo's window (where opening again would be a no-op).
@@ -94,7 +94,11 @@ export class SessionNode extends vscode.TreeItem {
     const max = vscode.workspace
       .getConfiguration("claudeControlCenter")
       .get<number>("sidebarTitleMaxLength", 40);
-    const raw = s.title || s.lastPrompt || s.sessionId.slice(0, 8);
+    // Title only — never fall back to lastPrompt: that updates every turn, so
+    // the row label kept churning to whatever was typed most recently. An
+    // untitled session shows its short id until the ai-title lands, then stays
+    // put.
+    const raw = s.title || s.sessionId.slice(0, 8);
     return max > 0 ? truncate(raw, max) : raw;
   }
 
@@ -114,10 +118,22 @@ export class SessionNode extends vscode.TreeItem {
     return bits.join(" · ");
   }
 
+  // How recently a session's log changed to still count as "fresh" when it's
+  // finished-and-reviewed. Fresh reviewed sessions keep a coloured check so the
+  // handful you're actively cycling stand out from the long grey tail of old
+  // done/idle rows; older reviewed ones fade to the dim grey below.
+  private static reviewedFreshMs(): number {
+    const min = vscode.workspace
+      .getConfiguration("claudeControlCenter")
+      .get<number>("reviewedFreshMinutes", 20);
+    return Math.max(0, min) * 60_000;
+  }
+
   private static icon(
-    status: SessionStatus,
+    s: Session,
     iconsBase?: vscode.Uri
   ): vscode.ThemeIcon | vscode.Uri {
+    const status = s.status;
     // Attention states use SVG-file icons with SMIL (<animate>) animations —
     // Chromium runs SMIL even for images used as CSS backgrounds, which is how
     // the tree renders file icons, so these genuinely move (codicons only
@@ -127,7 +143,7 @@ export class SessionNode extends vscode.TreeItem {
     //   awaiting     = exploding blue dot / radar ping (blocked on your input)
     //   pendingReview = pulsing orange dot (done, but you haven't checked it
     //                  since it last changed — your move)
-    //   finished     = dim outline check (done AND reviewed)
+    //   finished     = green check if reviewed recently, else dim outline check
     //   idle         = faint grey dot (stale: quiet > idle window)
     if (iconsBase) {
       if (status === "active") {
@@ -151,8 +167,13 @@ export class SessionNode extends vscode.TreeItem {
       return new vscode.ThemeIcon("pass-filled", new vscode.ThemeColor("charts.yellow"));
     }
     if (status === "finished") {
-      // Dim outline check — done and you've already checked it.
-      return new vscode.ThemeIcon("pass", new vscode.ThemeColor("disabledForeground"));
+      // Reviewed, but recently active → keep it visible (green check) so the
+      // sessions you're currently cycling don't vanish into the grey tail.
+      // Older reviewed sessions dim to a grey outline check like idle rows.
+      const fresh = Date.now() - s.mtimeMs <= SessionNode.reviewedFreshMs();
+      return fresh
+        ? new vscode.ThemeIcon("pass", new vscode.ThemeColor("charts.green"))
+        : new vscode.ThemeIcon("pass", new vscode.ThemeColor("disabledForeground"));
     }
     if (status === "interrupted") {
       // Unfinished turn (ESC / window died / API error) — orange stop sign.

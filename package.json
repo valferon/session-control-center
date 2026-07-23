@@ -265,6 +265,11 @@
           "default": 24,
           "description": "A session not Active but touched within this many hours is shown as Finished; older than this is Idle (stale, hidden by default)."
         },
+        "claudeControlCenter.reviewedFreshMinutes": {
+          "type": "number",
+          "default": 20,
+          "description": "A finished session you've already reviewed keeps a green check (instead of fading to grey) while its log changed within this many minutes, so the recent sessions you're cycling stand out from old done/idle rows."
+        },
         "claudeControlCenter.projectsDir": {
           "type": "string",
           "default": "",
