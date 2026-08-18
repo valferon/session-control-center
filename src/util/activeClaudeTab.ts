@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { Session } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
+import { normPath, pathRelated } from "./pathMatch";
 
 // viewType of the Claude plugin's session editor tabs (same constant as
 // sessionActions.revealExistingClaudeTab — a webview tab exposes no session id,
@@ -124,19 +125,6 @@ function truncatedPrefix(label: string): string | undefined {
     prefix = label.slice(0, -3).trimEnd();
   }
   return prefix !== undefined && prefix.length >= MIN_PREFIX_MATCH ? prefix : undefined;
-}
-
-function normPath(p: string): string {
-  return vscode.Uri.file(p).fsPath.replace(/\/+$/, "");
-}
-
-// Same dir or one contains the other, on path-segment boundaries.
-function pathRelated(a: string, b: string): boolean {
-  if (a === b) {
-    return true;
-  }
-  const [shorter, longer] = a.length < b.length ? [a, b] : [b, a];
-  return longer.startsWith(shorter + "/");
 }
 
 // Stable key of the active tab, used to skip refreshes when tab focus events

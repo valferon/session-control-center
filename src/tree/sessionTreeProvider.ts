@@ -7,6 +7,8 @@ import { SeenStore } from "../data/seenStore";
 import { readModelSettings } from "../data/paths";
 import { findSessionForActiveTab } from "../util/activeClaudeTab";
 import { projectUri, WindowRepoDecorations } from "./sessionDecorations";
+import { normPath, pathRelated } from "../util/pathMatch";
+import { fmtNum, relTime, truncate } from "../util/fmt";
 
 export class ProjectNode extends vscode.TreeItem {
   constructor(public readonly group: ProjectGroup) {
@@ -48,7 +50,15 @@ export class SessionNode extends vscode.TreeItem {
     public readonly session: Session,
     public readonly archived = false,
     public readonly iconsBase?: vscode.Uri,
-    revision = 0
+    revision = 0,
+    // True for the N most recently active finished sessions (provider-computed
+    // rank, not a time window): these keep a coloured check so the handful
+    // you're actively cycling stand out from the long grey tail.
+    recentlyChecked = false,
+    // True when the pendingReview state comes from an explicit "mark as
+    // unread" rather than from new activity — surfaced in the tooltip so an
+    // orange row you flagged yourself doesn't read as a session that moved.
+    markedUnread = false
   ) {
     // Sessions are leaves EXCEPT while subagents or workflows are running:
     // those get an indented child row per live agent / workflow run. Expanded
@@ -79,8 +89,8 @@ export class SessionNode extends vscode.TreeItem {
       `session-${s.status}` + (s.cwd ? "" : "-nocwd") + (archived ? "-archived" : "");
     this.iconPath = archived
       ? new vscode.ThemeIcon("archive", new vscode.ThemeColor("disabledForeground"))
-      : SessionNode.icon(s, iconsBase);
-    this.tooltip = SessionNode.tooltip(s);
+      : SessionNode.icon(s, iconsBase, recentlyChecked);
+    this.tooltip = SessionNode.tooltip(s, markedUnread);
     // Default click: smart open — opens the repo, or starts Claude if you're
     // already in that repo's window (where opening again would be a no-op).
     this.command = {
@@ -94,11 +104,11 @@ export class SessionNode extends vscode.TreeItem {
     const max = vscode.workspace
       .getConfiguration("claudeControlCenter")
       .get<number>("sidebarTitleMaxLength", 40);
-    // Title only — never fall back to lastPrompt: that updates every turn, so
-    // the row label kept churning to whatever was typed most recently. An
-    // untitled session shows its short id until the ai-title lands, then stays
-    // put.
-    const raw = s.title || s.sessionId.slice(0, 8);
+    // Custom (user-renamed) title wins; then the AI title; never lastPrompt —
+    // that updates every turn, so the row label kept churning to whatever was
+    // typed most recently. An untitled session shows its short id until the
+    // ai-title lands, then stays put.
+    const raw = s.customTitle || s.title || s.sessionId.slice(0, 8);
     return max > 0 ? truncate(raw, max) : raw;
   }
 
@@ -118,20 +128,10 @@ export class SessionNode extends vscode.TreeItem {
     return bits.join(" · ");
   }
 
-  // How recently a session's log changed to still count as "fresh" when it's
-  // finished-and-reviewed. Fresh reviewed sessions keep a coloured check so the
-  // handful you're actively cycling stand out from the long grey tail of old
-  // done/idle rows; older reviewed ones fade to the dim grey below.
-  private static reviewedFreshMs(): number {
-    const min = vscode.workspace
-      .getConfiguration("claudeControlCenter")
-      .get<number>("reviewedFreshMinutes", 20);
-    return Math.max(0, min) * 60_000;
-  }
-
   private static icon(
     s: Session,
-    iconsBase?: vscode.Uri
+    iconsBase: vscode.Uri | undefined,
+    recentlyChecked: boolean
   ): vscode.ThemeIcon | vscode.Uri {
     const status = s.status;
     // Attention states use SVG-file icons with SMIL (<animate>) animations —
@@ -167,11 +167,12 @@ export class SessionNode extends vscode.TreeItem {
       return new vscode.ThemeIcon("pass-filled", new vscode.ThemeColor("charts.yellow"));
     }
     if (status === "finished") {
-      // Reviewed, but recently active → keep it visible (green check) so the
-      // sessions you're currently cycling don't vanish into the grey tail.
-      // Older reviewed sessions dim to a grey outline check like idle rows.
-      const fresh = Date.now() - s.mtimeMs <= SessionNode.reviewedFreshMs();
-      return fresh
+      // One of the last-N checked sessions → keep it visible (green check) so
+      // the sessions you're currently cycling don't vanish into the grey tail.
+      // Rank-based, not time-based: a quiet hour doesn't fade your working set,
+      // and a busy burst doesn't light up a dozen rows. Older reviewed
+      // sessions dim to a grey outline check like idle rows.
+      return recentlyChecked
         ? new vscode.ThemeIcon("pass", new vscode.ThemeColor("charts.green"))
         : new vscode.ThemeIcon("pass", new vscode.ThemeColor("disabledForeground"));
     }
@@ -182,18 +183,23 @@ export class SessionNode extends vscode.TreeItem {
     return new vscode.ThemeIcon("circle-outline", new vscode.ThemeColor("disabledForeground"));
   }
 
-  private static tooltip(s: Session): vscode.MarkdownString {
+  private static tooltip(s: Session, markedUnread = false): vscode.MarkdownString {
     const a = s.aggregates;
     const tk = a.tokens;
     const total = tk.inputTokens + tk.outputTokens + tk.cacheCreationInputTokens + tk.cacheReadInputTokens;
     const md = new vscode.MarkdownString(undefined, true);
-    md.appendMarkdown(`**${s.title || "(untitled session)"}**\n\n`);
+    md.appendMarkdown(`**${s.customTitle || s.title || "(untitled session)"}**\n\n`);
+    if (s.customTitle && s.title) {
+      md.appendMarkdown(`_AI title: ${s.title}_\n\n`);
+    }
     if (s.lastPrompt) {
       md.appendMarkdown(`_${truncate(s.lastPrompt, 140)}_\n\n`);
     }
     const label =
       s.status === "pendingReview"
-        ? "pending review"
+        ? markedUnread
+          ? "pending review · marked unread"
+          : "pending review"
         : s.status === "finished"
           ? "finished · checked"
           : s.status;
@@ -277,10 +283,15 @@ export class WorkflowNode extends vscode.TreeItem {
 }
 
 // Indented child row under a session: one live subagent, purple sweeping dot.
-// Click opens the agent's raw sidechain log.
+// Click opens a rendered transcript of the agent's sidechain log (the raw
+// jsonl is a wall of JSON — it's still reachable via the context menu).
 export class AgentNode extends vscode.TreeItem {
+  // Read by the openAgentRawLog command (context menu passes the node itself).
+  readonly agentFilePath: string;
+
   constructor(agent: RunningAgent, iconsBase?: vscode.Uri) {
     super(agent.description || agent.agentType, vscode.TreeItemCollapsibleState.None);
+    this.agentFilePath = agent.filePath;
     this.description = agent.description ? agent.agentType : relTime(agent.mtimeMs);
     this.contextValue = "ccAgent";
     this.iconPath = iconsBase
@@ -289,12 +300,13 @@ export class AgentNode extends vscode.TreeItem {
     this.tooltip = new vscode.MarkdownString(
       `**${agent.description || "(no description)"}**\n\n` +
         `Type: \`${agent.agentType}\` · last write ${relTime(agent.mtimeMs)}\n\n` +
+        `Click for a live transcript (prompt, tool calls, result)\n\n` +
         `\`${agent.filePath}\``
     );
     this.command = {
-      command: "vscode.open",
-      title: "Open Agent Log",
-      arguments: [vscode.Uri.file(agent.filePath)],
+      command: "claudeControlCenter.openAgentTranscript",
+      title: "Open Agent Transcript",
+      arguments: [agent.filePath],
     };
   }
 }
@@ -313,7 +325,7 @@ export class UsageNode extends vscode.TreeItem {
 export class FocusedNode extends vscode.TreeItem {
   constructor(public readonly session: Session) {
     super("Current session", vscode.TreeItemCollapsibleState.Expanded);
-    this.description = truncate(session.title ?? session.sessionId.slice(0, 8), 30);
+    this.description = truncate(session.customTitle ?? session.title ?? session.sessionId.slice(0, 8), 30);
     this.contextValue = "ccFocused";
     this.iconPath = new vscode.ThemeIcon("target");
   }
@@ -402,6 +414,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   }
 
   dispose(): void {
+    if (this.fireTimer) {
+      clearTimeout(this.fireTimer);
+    }
     this._onDidChangeTreeData.dispose();
     this.decorations.dispose();
   }
@@ -444,6 +459,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
       return this.focusedStats(element.session);
     }
     if (element instanceof ProjectNode) {
+      const recent = this.recentFinishedIds();
       return element.group.sessions
         .filter((s) => this.matches(s))
         .map(
@@ -452,7 +468,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
               s,
               this.archive.isArchived(s.sessionId),
               this.extensionUri,
-              this.revision
+              this.revision,
+              recent.has(s.sessionId),
+              this.seen.isMarkedUnread(s.sessionId)
             )
         );
     }
@@ -467,6 +485,30 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
       return element.workflow.agents.map((a) => new AgentNode(a, element.iconsBase));
     }
     return [];
+  }
+
+  // The N most recently active finished (checked) sessions ACROSS ALL projects
+  // — these keep their green check while the rest of the reviewed tail fades
+  // grey. Computed over the unfiltered store so toggling filters/search never
+  // changes which sessions count as your working set. Rank replaces the old
+  // reviewedFreshMinutes time window: "the last 5 I checked" stays lit however
+  // long ago that was.
+  private recentFinishedIds(): Set<string> {
+    const n = vscode.workspace
+      .getConfiguration("claudeControlCenter")
+      .get<number>("recentFinishedCount", 5);
+    if (n <= 0) {
+      return new Set();
+    }
+    return new Set(
+      this.store
+        .getGroups()
+        .flatMap((g) => g.sessions)
+        .filter((s) => s.status === "finished")
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .slice(0, n)
+        .map((s) => s.sessionId)
+    );
   }
 
   // The project group(s) whose repo is open in THIS window. Match by
@@ -618,7 +660,36 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     return nodes;
   }
 
+  // Throttle window for tree repaints. Store changes arrive in bursts (an
+  // active session's watcher events every ~500ms, plus tick/seen/usage events
+  // stacking) and every fire rebuilds EVERY visible node (ids are
+  // revision-salted by design). Leading edge fires immediately so a single
+  // status flip still feels instant; the trailing timer coalesces the burst.
+  private static readonly FIRE_THROTTLE_MS = 250;
+  private fireTimer?: NodeJS.Timeout;
+  private firePending = false;
+  private lastFireMs = 0;
+
   private fire(): void {
+    const now = Date.now();
+    if (now - this.lastFireMs >= SessionTreeProvider.FIRE_THROTTLE_MS) {
+      this.doFire(now);
+      return;
+    }
+    this.firePending = true;
+    if (!this.fireTimer) {
+      this.fireTimer = setTimeout(() => {
+        this.fireTimer = undefined;
+        if (this.firePending) {
+          this.doFire(Date.now());
+        }
+      }, SessionTreeProvider.FIRE_THROTTLE_MS - (now - this.lastFireMs));
+    }
+  }
+
+  private doFire(now: number): void {
+    this.lastFireMs = now;
+    this.firePending = false;
     this.revision++;
     this.updateMessage();
     this._onDidChangeTreeData.fire();
@@ -663,7 +734,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
       return false;
     }
     if (this.filter) {
-      const hay = [s.title, s.lastPrompt, s.gitBranch, s.cwd, s.sessionId, s.aggregates.models.join(" ")]
+      const hay = [s.customTitle, s.title, s.lastPrompt, s.gitBranch, s.cwd, s.sessionId, s.aggregates.models.join(" ")]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
@@ -679,30 +750,6 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
 // bucket — the point where per-turn cost climbs even with caching.
 const CTX_WARN_TOKENS = 150_000;
 
-// Compact by design ("2h", not "2h ago") — session rows have ~30 chars of
-// description before the sidebar clips them.
-function relTime(ms: number): string {
-  const diff = Date.now() - ms;
-  const s = Math.floor(diff / 1000);
-  if (s < 60) {
-    return `${s}s`;
-  }
-  const m = Math.floor(s / 60);
-  if (m < 60) {
-    return `${m}m`;
-  }
-  const h = Math.floor(m / 60);
-  if (h < 24) {
-    return `${h}h`;
-  }
-  const d = Math.floor(h / 24);
-  return `${d}d`;
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + "…" : s;
-}
-
 // Compact family name of the session's most-used model ("" when unknown).
 function shortModel(models: string[]): string {
   if (models.length === 0) {
@@ -715,20 +762,6 @@ function shortModel(models: string[]): string {
     }
   }
   return models[0];
-}
-
-function normPath(p: string): string {
-  return vscode.Uri.file(p).fsPath.replace(/\/+$/, "");
-}
-
-// True when two normalized paths are the same dir or one contains the other,
-// matching on path-segment boundaries so "/a/foo" never matches "/a/foobar".
-function pathRelated(a: string, b: string): boolean {
-  if (a === b) {
-    return true;
-  }
-  const [shorter, longer] = a.length < b.length ? [a, b] : [b, a];
-  return longer.startsWith(shorter + "/");
 }
 
 function usageNode(label: string, span: string | undefined, w: UsageWindow): StatNode {
@@ -790,14 +823,4 @@ function compactDur(ms: number): string {
     return `${h}h${String(m).padStart(2, "0")}m`;
   }
   return `${m}m`;
-}
-
-function fmtNum(n: number): string {
-  if (n >= 1_000_000) {
-    return (n / 1_000_000).toFixed(2) + "M";
-  }
-  if (n >= 1_000) {
-    return (n / 1_000).toFixed(1) + "k";
-  }
-  return String(n);
 }

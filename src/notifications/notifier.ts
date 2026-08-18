@@ -177,7 +177,7 @@ export class SessionNotifier {
     if (!(await this.claim(key))) {
       return; // another window is showing this one
     }
-    const name = s.title || s.lastPrompt?.slice(0, 50) || s.sessionId.slice(0, 8);
+    const name = s.customTitle || s.title || s.lastPrompt?.slice(0, 50) || s.sessionId.slice(0, 8);
     const project = s.cwd ? s.cwd.split("/").pop() : "session";
     const verb =
       s.status === "awaiting"
@@ -202,7 +202,7 @@ export class SessionNotifier {
     if (!(await this.claim(`${s.sessionId}:pr:${pr.prUrl}`))) {
       return;
     }
-    const name = s.title || s.sessionId.slice(0, 8);
+    const name = s.customTitle || s.title || s.sessionId.slice(0, 8);
     void vscode.window
       .showInformationMessage(`🔗 PR #${pr.prNumber} linked: "${name}"`, "Open PR")
       .then((choice) => {

@@ -16,6 +16,8 @@ import {
   startClaudeInCwd,
 } from "./actions/sessionActions";
 import { SessionNotifier } from "./notifications/notifier";
+import { registerAgentTranscript } from "./views/agentTranscript";
+import { TitleStore } from "./data/titleStore";
 import { UsageService } from "./data/usageService";
 import { lastActivityMs } from "./data/jsonlParser";
 import { modelSettingsFile, readModelSettings, writeModelSetting } from "./data/paths";
@@ -25,12 +27,14 @@ import { initLog, log } from "./util/log";
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   context.subscriptions.push(initLog());
   const cache = new SessionCache(context.globalStorageUri);
-  await cache.load();
-
   const seen = new SeenStore(context.globalStorageUri, context.globalState);
-  await seen.load();
+  const titles = new TitleStore(context.globalStorageUri);
+  // Independent stores, independent files — load them concurrently instead of
+  // serially gating activation on three round-trips to disk.
+  await Promise.all([cache.load(), seen.load(), titles.load()]);
   context.subscriptions.push({ dispose: () => seen.dispose() });
-  const store = new SessionStore(cache, seen);
+  context.subscriptions.push({ dispose: () => titles.dispose() });
+  const store = new SessionStore(cache, seen, titles);
   context.subscriptions.push({ dispose: () => store.dispose() });
   const usage = new UsageService(context.globalStorageUri);
   context.subscriptions.push({ dispose: () => usage.dispose() });
@@ -41,6 +45,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Opening a session marks it seen; re-scan so its status flips
   // pendingReview -> finished (cached parse, cheap).
   context.subscriptions.push(seen.onDidChange(() => void store.refresh()));
+  // Renames are a read-time overlay — no re-scan needed, just re-render.
+  context.subscriptions.push(titles.onDidChange(() => treeProvider.refresh()));
 
   const treeView = vscode.window.createTreeView("claudeControlCenter.sessions", {
     treeDataProvider: treeProvider,
@@ -52,6 +58,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.registerFileDecorationProvider(treeProvider.decorations),
     { dispose: () => treeProvider.dispose() }
   );
+
+  // Readable transcript view for subagent logs (sidebar agent rows open it).
+  registerAgentTranscript(context);
 
   // Initial scan + usage fetch. Jitter the usage fetch so multiple windows
   // restoring at once don't all hit the API before the shared claim is visible.
@@ -78,7 +87,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (e.affectsConfiguration("claudeControlCenter.usage.enabled")) {
         void usage.refresh(true);
       }
-      if (e.affectsConfiguration("claudeControlCenter.sidebarTitleMaxLength")) {
+      if (
+        e.affectsConfiguration("claudeControlCenter.sidebarTitleMaxLength") ||
+        e.affectsConfiguration("claudeControlCenter.recentFinishedCount")
+      ) {
         treeProvider.refresh();
       }
     })
@@ -92,6 +104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // best-effort), so cross-window "reviewed" marks converge within a tick.
   const tick = setInterval(() => {
     void seen.sync();
+    void titles.sync();
     void store.refresh();
   }, 30_000);
   context.subscriptions.push({ dispose: () => clearInterval(tick) });
@@ -124,6 +137,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!s || s.status !== "pendingReview") {
       return;
     }
+    if (seen.isMarkedUnread(s.sessionId)) {
+      return; // you flagged it to come back to; don't quietly un-flag it
+    }
     const markKey = `${s.sessionId}:${lastActivityMs(s.aggregates, s.mtimeMs)}`;
     if (markKey === lastAutoMark) {
       return; // already marked at this watermark; refresh hasn't landed yet
@@ -133,7 +149,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Same watermark semantics as openSession: wall-clock now, floored at the
     // parsed watermark — the parse can lag the file, and marking at a stale
     // watermark would leave the session pendingReview on the next re-scan.
-    void seen.markSeen(s.sessionId, Math.max(lastActivityMs(s.aggregates, s.mtimeMs), Date.now()));
+    // passive: a focused tab is a guess that you read it, so it must NOT clear
+    // an explicit "mark as unread" — otherwise flagging the session you're
+    // looking at would be undone by the next refresh.
+    void seen.markSeen(
+      s.sessionId,
+      Math.max(lastActivityMs(s.aggregates, s.mtimeMs), Date.now()),
+      { passive: true }
+    );
   };
   // A session that flips to pendingReview WHILE its tab is focused (you watched
   // it finish) is also instantly reviewed.
@@ -224,6 +247,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       await seen.markAllSeen(pending);
     }),
+    // Put a checked (green) session back to pendingReview (orange) so it stands
+    // out again later. Explicit user intent, so it beats the watermark and
+    // survives the passive focused-tab auto-mark above; opening the session, or
+    // "mark all as read", clears it.
+    vscode.commands.registerCommand("claudeControlCenter.markSessionUnread", (arg) => {
+      const id = sessionIdFrom(arg);
+      if (id) {
+        void seen.markUnread(id);
+      }
+    }),
     vscode.commands.registerCommand("claudeControlCenter.toggleHideIdle", () => {
       treeProvider.toggleHideIdle();
     }),
@@ -296,6 +329,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("claudeControlCenter.setModel", async () => {
       await setModel(treeProvider);
     }),
+    vscode.commands.registerCommand("claudeControlCenter.renameSession", async (arg) => {
+      const ref = sessionFrom(arg);
+      const session = typeof ref === "string" ? store.getSession(ref) : ref;
+      if (!session) {
+        return;
+      }
+      const typed = await vscode.window.showInputBox({
+        prompt: `Rename session (shown in this sidebar only — Claude Code's own tabs keep their name)`,
+        placeHolder: "Empty to restore the AI-generated title",
+        value: session.customTitle ?? session.title ?? "",
+      });
+      if (typed === undefined) {
+        return; // cancelled
+      }
+      // Same as the AI title = no override needed.
+      const next = typed.trim() === (session.title ?? "") ? "" : typed;
+      await titles.rename(session.sessionId, next);
+    }),
     vscode.commands.registerCommand("claudeControlCenter.deleteSession", (arg) => {
       // Exact Session from the clicked row — a duplicated conversation must
       // delete the copy the user pointed at, not whichever id lookup finds.
@@ -329,9 +380,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.onDidChangeWindowState((e) => {
       if (e.focused) {
         void consumePendingOpenSession(context);
-        // Catch up on marks made in other windows the instant you switch back,
-        // instead of waiting for the watcher (best-effort) or the 30s tick.
+        // Catch up on marks/renames made in other windows the instant you
+        // switch back, instead of waiting for the watcher (best-effort) or
+        // the 30s tick.
         void seen.sync();
+        void titles.sync();
         // Alt-tabbing into this window with a session's tab already active
         // counts as reviewing it — no tab event fires on a plain window switch.
         markFocusedSessionSeen();

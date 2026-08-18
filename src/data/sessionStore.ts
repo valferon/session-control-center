@@ -19,6 +19,7 @@ import {
 import { decodeEncodedDir, resolveProjectsDir } from "./paths";
 import { SessionCache } from "./cache";
 import { SeenStore } from "./seenStore";
+import { TitleStore } from "./titleStore";
 import { debug, debugEnabled, log } from "../util/log";
 
 export interface StoreConfig {
@@ -45,6 +46,14 @@ const HOT_PARSER_MAX = 16;
 // the disk busy without starving the extension host event loop.
 const SCAN_PARSE_CONCURRENCY = 8;
 
+// How long a sidechain probe result stays valid. Probes are the scan's main
+// fs cost (readdir + a stat per agent log, per non-idle session) and scans
+// stack up: the 30s tick, every watcher event, every seen-mark each trigger
+// one. Sidechain changes reach the UI via that same tick anyway (agent logs
+// live in subdirs the watcher doesn't cover), so a TTL below the tick period
+// dedups the fs work without adding any user-visible latency.
+const PROBE_TTL_MS = 10_000;
+
 // Owns the in-memory session index, drives (cached) parsing, and exposes the
 // grouped/aggregated view plus a change event for the UI.
 export class SessionStore {
@@ -68,10 +77,33 @@ export class SessionStore {
   // (already disposed) change emitter afterwards.
   private disposed = false;
 
+  // Memoized getGroups() result: consumers (tree root, notifier, dashboard,
+  // focused-tab join) each call it per change event, re-sorting every session
+  // each time. Invalidated on any session mutation (fireChanged) and on title
+  // overlay changes.
+  private groupsCache?: ProjectGroup[];
+  private titlesSub?: vscode.Disposable;
+
   constructor(
     private readonly cache: SessionCache,
-    private readonly seen: SeenStore
-  ) {}
+    private readonly seen: SeenStore,
+    private readonly titles?: TitleStore
+  ) {
+    this.titlesSub = titles?.onDidChange(() => (this.groupsCache = undefined));
+  }
+
+  private fireChanged(): void {
+    this.groupsCache = undefined;
+    this._onDidChange.fire();
+  }
+
+  // Attach the user's custom title (if any) at read time. Deliberately not
+  // baked into this.sessions/cache: renames change independently of the jsonl,
+  // and a read-time overlay can never go stale in the parse cache.
+  private withTitle(s: Session): Session {
+    const t = this.titles?.get(s.sessionId);
+    return t ? { ...s, customTitle: t } : s;
+  }
 
   // Split a clean-end "finished" into "pendingReview" (not opened since its last
   // change) vs "finished" (already reviewed). This is a SeenStore overlay on top
@@ -127,6 +159,11 @@ export class SessionStore {
   // gated to sessions that aren't idle anyway (readdir + a few stats per
   // session per evaluation; an idle session can't be flipped by sidechain
   // activity, so don't pay for it).
+  // TTL-cached (PROBE_TTL_MS): scans overlap and repeat far faster than
+  // sidechain state meaningfully changes. Entries for deleted sessions are
+  // dropped at scan end alongside the parse cache.
+  private readonly probeCache = new Map<string, { at: number; probe: SidechainProbe }>();
+
   private async sidechainActivity(
     filePath: string,
     sessionId: string,
@@ -137,7 +174,13 @@ export class SessionStore {
     if (now - activityMs > thresholds.idleMs) {
       return { newestMtimeMs: 0, running: [], workflows: [] };
     }
-    return probeSidechain(filePath, sessionId, thresholds, now);
+    const cached = this.probeCache.get(filePath);
+    if (cached && now - cached.at < PROBE_TTL_MS) {
+      return cached.probe;
+    }
+    const probe = await probeSidechain(filePath, sessionId, thresholds, now);
+    this.probeCache.set(filePath, { at: now, probe });
+    return probe;
   }
 
   // One-shot re-check of a file shortly after its downgrade grace expires.
@@ -162,6 +205,7 @@ export class SessionStore {
       clearTimeout(t);
     }
     this.settleTimers.clear();
+    this.titlesSub?.dispose();
     this._onDidChange.dispose();
   }
 
@@ -194,7 +238,7 @@ export class SessionStore {
         best = s;
       }
     }
-    return best;
+    return best && this.withTitle(best);
   }
 
   // Full reconcile of the projects dir. Coalesces concurrent calls.
@@ -232,7 +276,7 @@ export class SessionStore {
       projectDirs = await fs.promises.readdir(root, { withFileTypes: true });
     } catch {
       this.sessions = next;
-      this._onDidChange.fire();
+      this.fireChanged();
       return;
     }
 
@@ -341,6 +385,11 @@ export class SessionStore {
         this.hotParsers.delete(p);
       }
     }
+    for (const p of [...this.probeCache.keys()]) {
+      if (!livePaths.has(p)) {
+        this.probeCache.delete(p);
+      }
+    }
     this.cache.prune(livePaths);
     void this.cache.flush();
 
@@ -363,7 +412,7 @@ export class SessionStore {
     }
     this.logStatusChanges(this.sessions, next, cfg.thresholds, now);
     this.sessions = next;
-    this._onDidChange.fire();
+    this.fireChanged();
   }
 
   // Diagnostics for the "status is unreliable" reports: always log a session
@@ -413,7 +462,7 @@ export class SessionStore {
       // deleted
       this.hotParsers.delete(filePath);
       if (this.sessions.delete(filePath)) {
-        this._onDidChange.fire();
+        this.fireChanged();
       }
       return;
     }
@@ -450,7 +499,7 @@ export class SessionStore {
       if (before !== session.status) {
         log(`status ${before ?? "new"} -> ${session.status}  ${statusFactors(session, cfg.thresholds, now)}`);
       }
-      this._onDidChange.fire();
+      this.fireChanged();
       return;
     }
     // Incremental fast path: reuse the live parser for this file and consume
@@ -503,7 +552,7 @@ export class SessionStore {
         log(`status ${before ?? "new"} -> ${session.status}  ${statusFactors(session, cfg.thresholds, now)}`);
       }
       void this.cache.flush();
-      this._onDidChange.fire();
+      this.fireChanged();
     } catch {
       // Read failed mid-stream: the parser state may be partial — drop it so
       // the next event does a clean full parse.
@@ -525,8 +574,12 @@ export class SessionStore {
   }
 
   getGroups(): ProjectGroup[] {
+    if (this.groupsCache) {
+      return this.groupsCache;
+    }
     const byKey = new Map<string, ProjectGroup>();
-    for (const s of this.sessions.values()) {
+    for (const raw of this.sessions.values()) {
+      const s = this.withTitle(raw);
       const key = s.cwd ?? `enc:${s.encodedDir}`;
       let g = byKey.get(key);
       if (!g) {
@@ -576,6 +629,7 @@ export class SessionStore {
     groups.sort(
       (a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }) || a.key.localeCompare(b.key)
     );
+    this.groupsCache = groups;
     return groups;
   }
 

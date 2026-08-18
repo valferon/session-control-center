@@ -834,29 +834,31 @@ function isRealPrompt(message: any): boolean {
 
 async function readSubagents(filePath: string, sessionId: string): Promise<SubagentInfo[]> {
   const dir = path.join(path.dirname(filePath), sessionId, "subagents");
-  const out: SubagentInfo[] = [];
   let entries: string[];
   try {
     entries = await fs.promises.readdir(dir);
   } catch {
-    return out;
+    return [];
   }
-  for (const e of entries) {
-    if (!e.endsWith(".meta.json")) {
-      continue;
-    }
-    try {
-      const meta = JSON.parse(await fs.promises.readFile(path.join(dir, e), "utf8"));
-      out.push({
-        agentType: String(meta.agentType ?? "agent"),
-        description: String(meta.description ?? ""),
-        file: e,
-      });
-    } catch {
-      // ignore unreadable meta
-    }
-  }
-  return out;
+  // Concurrent reads: a session with dozens of agents was serializing dozens
+  // of tiny file reads inside every parse.
+  const metas = await Promise.all(
+    entries
+      .filter((e) => e.endsWith(".meta.json"))
+      .map(async (e): Promise<SubagentInfo | undefined> => {
+        try {
+          const meta = JSON.parse(await fs.promises.readFile(path.join(dir, e), "utf8"));
+          return {
+            agentType: String(meta.agentType ?? "agent"),
+            description: String(meta.description ?? ""),
+            file: e,
+          };
+        } catch {
+          return undefined; // ignore unreadable meta
+        }
+      })
+  );
+  return metas.filter((m): m is SubagentInfo => m !== undefined);
 }
 
 function mostFrequent(counts: Map<string, number>): string | undefined {

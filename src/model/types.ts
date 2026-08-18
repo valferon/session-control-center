@@ -6,7 +6,8 @@
 // pendingReview = ended cleanly within the idle window but you HAVEN'T opened it
 //             since it last changed — a completed session still awaiting your
 //             review. This is the default state a session lands in when it
-//             finishes; opening it (SeenStore) promotes it to "finished";
+//             finishes; opening it (SeenStore) promotes it to "finished".
+//             "Mark as Unread" puts a finished session back here on purpose;
 // finished  = ended cleanly AND you've already checked it since its last change
 //             (opened it at or after its current mtime) — reviewed, done;
 // interrupted = went quiet with an UNfinished turn: user hit ESC, the window
@@ -140,6 +141,11 @@ export interface Session {
   gitBranch?: string;
   version?: string;
   title?: string;
+  // User-chosen title (TitleStore overlay, attached at store read time). UI
+  // prefers this over `title`; `title` stays the AI-generated original because
+  // the tab↔session join (activeClaudeTab) matches Claude's own tab labels,
+  // which a rename here can't change.
+  customTitle?: string;
   lastPrompt?: string;
   status: SessionStatus;
   mtimeMs: number;

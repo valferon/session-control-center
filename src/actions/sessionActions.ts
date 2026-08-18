@@ -8,6 +8,7 @@ import { dirExists } from "../data/paths";
 import { Session } from "../model/types";
 import { log } from "../util/log";
 import { WINDOW_ID } from "../util/windowId";
+import { normPath, pathRelated } from "../util/pathMatch";
 
 type OpenMode = "newWindow" | "currentWindow" | "prompt";
 
@@ -22,7 +23,14 @@ const OPEN_SESSION_CMD = "claude-vscode.primaryEditor.open";
 const NEW_CONVERSATION_CMD = "claude-vscode.newConversation";
 // viewType of the plugin's session editor tabs (as seen via the tab API).
 const CLAUDE_PANEL_VIEW_TYPE = "claudeVSCodePanel";
-const PENDING_OPEN_KEY = "claudeControlCenter.pendingOpenSession";
+// Cross-window handoff marker lives in a FILE under globalStorage, not
+// globalState: Memento updates are not reliably visible to other ALREADY-OPEN
+// windows (each keeps its own in-memory copy), so the "repo already open in
+// another window" path — openFolder focuses that window, its focus handler
+// consumes the marker — read a stale nothing and silently did nothing. That
+// was the main way the project "+" button broke. A file re-read from disk on
+// focus is always fresh. (Same lesson as SeenStore's move off globalState.)
+const PENDING_OPEN_FILE = "pending-open.json";
 const PENDING_TTL_MS = 120_000;
 
 // A session action argument: the exact Session (from a tree node — never
@@ -35,13 +43,13 @@ function resolveSession(store: SessionStore, ref: SessionRef): Session | undefin
   return typeof ref === "string" ? store.getSession(ref) : ref;
 }
 
-function norm(p: string): string {
-  return vscode.Uri.file(p).fsPath.replace(/\/+$/, "");
-}
-
+// Containment, not equality: a window often has a SUBDIR of the repo open (or
+// a parent). Exact matching sent those to a pointless new window — and worse,
+// the handoff marker then rotted because no window's folders ever equalled the
+// session's repo root, so the "+"/open never happened.
 function inCurrentWorkspace(cwd: string): boolean {
-  const target = norm(cwd);
-  return (vscode.workspace.workspaceFolders ?? []).some((f) => norm(f.uri.fsPath) === target);
+  const target = normPath(cwd);
+  return (vscode.workspace.workspaceFolders ?? []).some((f) => pathRelated(normPath(f.uri.fsPath), target));
 }
 
 // Editor-group focus commands by visual group index (tabGroups.all order).
@@ -171,7 +179,7 @@ export async function openSession(
     return;
   }
   log(`openSession: opening window for ${cwd} then reopening session there`);
-  await context.globalState.update(PENDING_OPEN_KEY, {
+  await writePending(context, {
     action: "open",
     sessionId: session.sessionId,
     cwd,
@@ -193,35 +201,83 @@ interface PendingAction {
   srcWindow?: string;
 }
 
+// --- pending-marker file IO ---
+
+function pendingUri(context: vscode.ExtensionContext): vscode.Uri {
+  return vscode.Uri.joinPath(context.globalStorageUri, PENDING_OPEN_FILE);
+}
+
+async function writePending(context: vscode.ExtensionContext, p: PendingAction): Promise<void> {
+  try {
+    await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+    await vscode.workspace.fs.writeFile(pendingUri(context), Buffer.from(JSON.stringify(p), "utf8"));
+  } catch (e) {
+    log(`writePending failed: ${e instanceof Error ? e.message : e}`);
+    void vscode.window.showWarningMessage("Couldn't queue the cross-window action (storage unwritable).");
+  }
+}
+
+async function readPending(context: vscode.ExtensionContext): Promise<PendingAction | undefined> {
+  try {
+    const buf = await vscode.workspace.fs.readFile(pendingUri(context));
+    const p = JSON.parse(Buffer.from(buf).toString("utf8")) as PendingAction;
+    return p && typeof p.cwd === "string" && typeof p.ts === "number" ? p : undefined;
+  } catch {
+    return undefined; // no marker (the overwhelmingly common case)
+  }
+}
+
+async function clearPending(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    await vscode.workspace.fs.delete(pendingUri(context));
+  } catch {
+    // already gone (another consumer won the race)
+  }
+}
+
+// Activation and focus can both fire within milliseconds of each other; without
+// this guard both read the marker before either deletes it and the action runs
+// TWICE (two new conversation panels).
+let consumeInFlight = false;
+
 // Called on activation AND whenever this window gains focus: if a window was
 // just opened (or focused — VS Code reuses an existing window when the folder
 // is already open, so activation alone never fires there) to act on a
 // session/repo, do it now.
 export async function consumePendingOpenSession(context: vscode.ExtensionContext): Promise<void> {
-  const p = context.globalState.get<PendingAction>(PENDING_OPEN_KEY);
-  if (!p) {
+  if (consumeInFlight) {
     return;
   }
-  if (Date.now() - p.ts > PENDING_TTL_MS) {
-    await context.globalState.update(PENDING_OPEN_KEY, undefined);
-    return;
+  consumeInFlight = true;
+  try {
+    const p = await readPending(context);
+    if (!p) {
+      return;
+    }
+    if (Date.now() - p.ts > PENDING_TTL_MS) {
+      await clearPending(context);
+      return;
+    }
+    if (p.srcWindow && p.srcWindow === WINDOW_ID) {
+      return; // our own request; the target window consumes it
+    }
+    if (inCurrentWorkspace(p.cwd)) {
+      await clearPending(context);
+      log(`consumePendingOpenSession: action=${p.action} cwd=${p.cwd}`);
+      await runWhenReady(p);
+    }
+    // else: leave the marker for the window whose workspace matches.
+  } finally {
+    consumeInFlight = false;
   }
-  if (p.srcWindow && p.srcWindow === WINDOW_ID) {
-    return; // our own request; the target window consumes it
-  }
-  if (inCurrentWorkspace(p.cwd)) {
-    await context.globalState.update(PENDING_OPEN_KEY, undefined);
-    log(`consumePendingOpenSession: action=${p.action} cwd=${p.cwd}`);
-    void runWhenReady(p);
-  }
-  // else: leave the marker for the window whose workspace matches.
 }
 
 // On a fresh window the Claude extension may not be active yet; wait for the
-// needed command to register (up to ~10s) before acting. Both actions go
-// through OPEN_SESSION_CMD (see its comment for why not NEW_CONVERSATION_CMD).
+// needed command to register (up to ~30s — a cold window restoring many
+// extensions can take well past 10s) before acting. Both actions go through
+// OPEN_SESSION_CMD (see its comment for why not NEW_CONVERSATION_CMD).
 async function runWhenReady(p: PendingAction): Promise<void> {
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 60; i++) {
     const cmds = await vscode.commands.getCommands(true);
     if (cmds.includes(OPEN_SESSION_CMD)) {
       break;
@@ -260,7 +316,7 @@ export async function startClaudeInCwd(context: vscode.ExtensionContext, cwd?: s
     return;
   }
   log(`startClaudeInCwd: opening ${cwd} then starting a new conversation there`);
-  await context.globalState.update(PENDING_OPEN_KEY, {
+  await writePending(context, {
     action: "new",
     cwd,
     ts: Date.now(),

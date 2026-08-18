@@ -2,7 +2,7 @@
   "name": "session-control-center",
   "displayName": "Session Control Center for Claude Code",
   "description": "Unofficial control center for local Claude Code sessions across all your repos: live sidebar, searchable dashboard, one-click context switch. Not affiliated with Anthropic.",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "publisher": "valferon",
   "license": "MIT",
   "icon": "icons/icon.png",
@@ -30,7 +30,6 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onView:claudeControlCenter.sessions",
     "onStartupFinished"
   ],
   "contributes": {
@@ -76,6 +75,11 @@
         "command": "claudeControlCenter.markAllReviewed",
         "title": "Claude Control Center: Mark All as Read",
         "icon": "$(check-all)"
+      },
+      {
+        "command": "claudeControlCenter.markSessionUnread",
+        "title": "Mark as Unread",
+        "icon": "$(eye-closed)"
       },
       {
         "command": "claudeControlCenter.toggleHideIdle",
@@ -144,6 +148,21 @@
         "command": "claudeControlCenter.setModel",
         "title": "Claude Control Center: Set Default Model",
         "icon": "$(chip)"
+      },
+      {
+        "command": "claudeControlCenter.renameSession",
+        "title": "Rename Session",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "claudeControlCenter.openAgentTranscript",
+        "title": "Open Agent Transcript",
+        "icon": "$(book)"
+      },
+      {
+        "command": "claudeControlCenter.openAgentRawLog",
+        "title": "Open Raw Agent Log (JSONL)",
+        "icon": "$(json)"
       }
     ],
     "menus": {
@@ -201,13 +220,8 @@
           "group": "inline@1"
         },
         {
-          "command": "claudeControlCenter.openSessionFolderNewWindow",
-          "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
-          "group": "inline@1"
-        },
-        {
-          "command": "claudeControlCenter.newConversationHere",
-          "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
+          "command": "claudeControlCenter.markSessionUnread",
+          "when": "view == claudeControlCenter.sessions && viewItem =~ /^session-finished(?:(?!archived).)*$/",
           "group": "inline@2"
         },
         {
@@ -221,9 +235,9 @@
           "group": "inline@3"
         },
         {
-          "command": "claudeControlCenter.deleteSession",
+          "command": "claudeControlCenter.renameSession",
           "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
-          "group": "inline@4"
+          "group": "navigation@0"
         },
         {
           "command": "claudeControlCenter.openSessionFolderHere",
@@ -231,9 +245,24 @@
           "group": "navigation@1"
         },
         {
-          "command": "claudeControlCenter.copySessionId",
+          "command": "claudeControlCenter.openSessionFolderNewWindow",
           "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
           "group": "navigation@2"
+        },
+        {
+          "command": "claudeControlCenter.copySessionId",
+          "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
+          "group": "navigation@3"
+        },
+        {
+          "command": "claudeControlCenter.newConversationHere",
+          "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
+          "group": "navigation@4"
+        },
+        {
+          "command": "claudeControlCenter.markSessionUnread",
+          "when": "view == claudeControlCenter.sessions && viewItem =~ /^session-finished/",
+          "group": "navigation@5"
         },
         {
           "command": "claudeControlCenter.archiveSession",
@@ -249,6 +278,11 @@
           "command": "claudeControlCenter.deleteSession",
           "when": "view == claudeControlCenter.sessions && viewItem =~ /^session/",
           "group": "danger@1"
+        },
+        {
+          "command": "claudeControlCenter.openAgentRawLog",
+          "when": "view == claudeControlCenter.sessions && viewItem == ccAgent",
+          "group": "navigation@1"
         }
       ]
     },
@@ -265,10 +299,10 @@
           "default": 24,
           "description": "A session not Active but touched within this many hours is shown as Finished; older than this is Idle (stale, hidden by default)."
         },
-        "claudeControlCenter.reviewedFreshMinutes": {
+        "claudeControlCenter.recentFinishedCount": {
           "type": "number",
-          "default": 20,
-          "description": "A finished session you've already reviewed keeps a green check (instead of fading to grey) while its log changed within this many minutes, so the recent sessions you're cycling stand out from old done/idle rows."
+          "default": 5,
+          "description": "The most recently active N finished (checked) sessions keep a green check instead of fading to grey, so the sessions you're cycling stand out from the tail of old done rows. 0 disables the highlight."
         },
         "claudeControlCenter.projectsDir": {
           "type": "string",
