@@ -93,7 +93,13 @@ export class DashboardPanel {
     const activity = computeActivity(groups);
     const message: ToWebview = {
       kind: "snapshot",
-      projects: groups,
+      // promptIndex is extension-side join material (see Session.promptIndex),
+      // never rendered — dropping it keeps a dozen prompts per session out of
+      // every snapshot postMessage.
+      projects: groups.map((g) => ({
+        ...g,
+        sessions: g.sessions.map(({ promptIndex: _drop, ...s }) => s),
+      })),
       metrics,
       activity,
       usage: this.usage.getCurrent(),

@@ -2,7 +2,7 @@
   "name": "session-control-center",
   "displayName": "Session Control Center for Claude Code",
   "description": "Unofficial control center for local Claude Code sessions across all your repos: live sidebar, searchable dashboard, one-click context switch. Not affiliated with Anthropic.",
-  "version": "0.1.23",
+  "version": "0.1.27",
   "publisher": "valferon",
   "license": "MIT",
   "icon": "icons/icon.png",
@@ -329,6 +329,11 @@
           "default": 40,
           "minimum": 0,
           "description": "Max characters of a session title shown in the sidebar before it is truncated with an ellipsis. 0 disables truncation (show full title)."
+        },
+        "claudeControlCenter.sidebarRecencyHeat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mark sidebar session rows with a square badge sized by how recently you worked in them (\u25a0 just now, \u25aa within 2h, \u25ab within 8h, nothing older), so the sessions you were just in stand out without reading timestamps."
         },
         "claudeControlCenter.debugLogging": {
           "type": "boolean",

@@ -622,7 +622,18 @@ export class SessionStore {
 
     const groups = [...byKey.values()];
     for (const g of groups) {
-      g.sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      // Order by the CONVERSATIONAL watermark, not raw file mtime — same key
+      // the status logic and the group's own lastActivityMs use. Raw mtime is
+      // bumped by non-conversational rewrites (ai-title regen, file-history
+      // snapshots), so a quiet session would jump to the top of its project
+      // for no visible reason and the row order flickered as unrelated
+      // sessions took turns being rewritten. Ties break on sessionId so equal
+      // watermarks hold a fixed order instead of riding on scan order.
+      g.sessions.sort(
+        (a, b) =>
+          lastActivityMs(b.aggregates, b.mtimeMs) - lastActivityMs(a.aggregates, a.mtimeMs) ||
+          a.sessionId.localeCompare(b.sessionId)
+      );
     }
     // Alphabetical by label so repos hold a stable position and don't jump
     // around as activity changes. Case-insensitive; ties broken by key.

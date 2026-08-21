@@ -49,6 +49,8 @@ export class SessionParser {
   private readonly prUrls = new Set<string>(); // dedup repeated pr-link records
   private title: string | undefined;
   private lastPrompt: string | undefined;
+  // Recent distinct human prompts, oldest first (see PROMPT_INDEX_MAX).
+  private promptIndex: string[] = [];
   private gitBranch: string | undefined;
   private version: string | undefined;
   private firstTs: string | undefined;
@@ -265,6 +267,7 @@ export class SessionParser {
       // and the interrupt marker isn't a prompt either.
       if (!interrupt && isRealPrompt(rec.message)) {
         agg.turns++;
+        this.notePrompt(rec.message);
       }
       // tool_result echoes carry the tool's output back into context — that
       // payload is what actually costs input tokens. Attribute its size to the
@@ -328,6 +331,32 @@ export class SessionParser {
     }
   }
 
+  // Remember a human prompt as a possible tab-label key.
+  //
+  // Claude's conversation PANEL labels an untitled session with the first
+  // prompt typed in that panel — which is neither the session's first prompt
+  // nor its last one once you reopen a session in a new panel (exactly what
+  // "open from the dashboard" does). So the join can't key on a single field;
+  // it needs the set of prompts the label could have come from. Bounded on
+  // both axes (count and length) because this rides in the parse cache and in
+  // the dashboard's postMessage payload.
+  private notePrompt(message: any): void {
+    const text = promptText(message);
+    if (!text) {
+      return;
+    }
+    const i = this.promptIndex.indexOf(text);
+    if (i !== -1) {
+      // Keep one entry per distinct prompt, most-recently-used last, so a
+      // repeated "yes" can't evict the whole window.
+      this.promptIndex.splice(i, 1);
+    }
+    this.promptIndex.push(text);
+    if (this.promptIndex.length > PROMPT_INDEX_MAX) {
+      this.promptIndex.shift();
+    }
+  }
+
   private collectContext(rec: any): void {
     if (typeof rec.cwd === "string" && rec.cwd) {
       this.cwdCounts.set(rec.cwd, (this.cwdCounts.get(rec.cwd) ?? 0) + 1);
@@ -386,6 +415,7 @@ export class SessionParser {
       version: this.version,
       title: this.title,
       lastPrompt: this.lastPrompt,
+      promptIndex: [...this.promptIndex],
       status,
       mtimeMs,
       sizeBytes,
@@ -817,6 +847,43 @@ function textPayloads(message: any): string[] {
 }
 
 // A user record is a real human prompt only if it isn't a tool_result echo.
+// How many distinct prompts a session keeps as tab-label candidates, and how
+// much of each. Sized from real sessions: a panel keeps the label it was given
+// when it opened, and a long-running session can take a hundred prompts after
+// that — a small window evicted the answer. 64 covers a multi-day session
+// end to end; the char cap is comfortably longer than any tab label (they are
+// ellipsis-truncated well before 60) and keeps essay-length prompts out of the
+// parse cache. Worst case ~4KB per session.
+const PROMPT_INDEX_MAX = 64;
+const PROMPT_KEY_CHARS = 60;
+
+// Single-line, length-capped form of a human prompt, or undefined when the
+// record isn't one a panel label could have come from. Slash-command echoes
+// (`<command-message>…`) and pasted-attachment wrappers are excluded: they are
+// never what a tab is labelled with.
+export function promptText(message: any): string | undefined {
+  const content = message?.content;
+  let raw: string | undefined;
+  if (typeof content === "string") {
+    raw = content;
+  } else if (Array.isArray(content)) {
+    for (const c of content) {
+      if (c && c.type === "text" && typeof c.text === "string") {
+        raw = c.text;
+        break;
+      }
+    }
+  }
+  const text = raw?.trim();
+  if (!text || text.startsWith("<")) {
+    return undefined;
+  }
+  // Collapse to one line: a tab label is single-line, so a multi-line prompt
+  // can only ever match on its first line anyway.
+  const line = text.split("\n", 1)[0].trim();
+  return line ? line.slice(0, PROMPT_KEY_CHARS) : undefined;
+}
+
 function isRealPrompt(message: any): boolean {
   if (!message) {
     return false;

@@ -29,7 +29,9 @@ const CACHE_NAME = "session-cache.json";
 //     conversational state; discard v6 entries so endedAt/status re-derive.
 // v8: aggregates gained `lastContextTokens` (live context occupancy for the
 //     sidebar indicator); discard v7 entries so it gets populated.
-const CACHE_VERSION = 8 as const;
+// v9: sessions gained `promptIndex` (tab-label candidates for the tab↔session
+//     join); discard v8 entries so it gets populated.
+const CACHE_VERSION = 9 as const;
 
 // Persisted per-session aggregate cache, keyed by file path + (mtime,size).
 // Lives in globalStorageUri so it survives reloads and is trivially nukable.

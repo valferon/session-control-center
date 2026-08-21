@@ -29,18 +29,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const cache = new SessionCache(context.globalStorageUri);
   const seen = new SeenStore(context.globalStorageUri, context.globalState);
   const titles = new TitleStore(context.globalStorageUri);
+  // globalState is passed only as the one-time migration source (the archive
+  // used to live there); the set itself is file-backed so other windows see it.
+  const archive = new ArchiveStore(context.globalStorageUri, context.globalState);
   // Independent stores, independent files — load them concurrently instead of
-  // serially gating activation on three round-trips to disk.
-  await Promise.all([cache.load(), seen.load(), titles.load()]);
+  // serially gating activation on four round-trips to disk.
+  await Promise.all([cache.load(), seen.load(), titles.load(), archive.load()]);
   context.subscriptions.push({ dispose: () => seen.dispose() });
   context.subscriptions.push({ dispose: () => titles.dispose() });
+  context.subscriptions.push({ dispose: () => archive.dispose() });
   const store = new SessionStore(cache, seen, titles);
   context.subscriptions.push({ dispose: () => store.dispose() });
   const usage = new UsageService(context.globalStorageUri);
   context.subscriptions.push({ dispose: () => usage.dispose() });
-  const archive = new ArchiveStore(context.globalState);
-  context.subscriptions.push({ dispose: () => archive.dispose() });
   const treeProvider = new SessionTreeProvider(store, usage, archive, seen, context.extensionUri);
+
+  // A session that starts working again stops being "archived" (see
+  // ArchiveStore.syncLiveSessions). Driven off the store's change event so it
+  // covers every route back to life — dashboard open, `claude --resume` in a
+  // terminal, another window — not just this window's open command. The
+  // archive's own change event only re-renders the tree, so no refresh loop.
+  context.subscriptions.push(
+    store.onDidChange(() => {
+      void archive.syncLiveSessions(store.getGroups().flatMap((g) => g.sessions));
+    })
+  );
 
   // Opening a session marks it seen; re-scan so its status flips
   // pendingReview -> finished (cached parse, cheap).
@@ -56,6 +69,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     treeView,
     vscode.window.registerFileDecorationProvider(treeProvider.decorations),
+    vscode.window.registerFileDecorationProvider(treeProvider.heatDecorations),
     { dispose: () => treeProvider.dispose() }
   );
 
@@ -77,7 +91,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({ dispose: () => watcher.dispose() });
 
   // Notifications on "finished work" transitions (active -> idle, new PR).
-  const notifier = new SessionNotifier(store, context.globalStorageUri, (id) => void openSession(store, context, id, seen));
+  const notifier = new SessionNotifier(store, context.globalStorageUri, (id) => void openSession(store, context, id, seen, archive));
   context.subscriptions.push({ dispose: () => notifier.dispose() });
 
   // React immediately when the opt-in usage panel is toggled, instead of waiting
@@ -89,7 +103,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       if (
         e.affectsConfiguration("claudeControlCenter.sidebarTitleMaxLength") ||
-        e.affectsConfiguration("claudeControlCenter.recentFinishedCount")
+        e.affectsConfiguration("claudeControlCenter.recentFinishedCount") ||
+        e.affectsConfiguration("claudeControlCenter.sidebarRecencyHeat")
       ) {
         treeProvider.refresh();
       }
@@ -105,6 +120,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const tick = setInterval(() => {
     void seen.sync();
     void titles.sync();
+    void archive.sync();
     void store.refresh();
   }, 30_000);
   context.subscriptions.push({ dispose: () => clearInterval(tick) });
@@ -281,14 +297,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("claudeControlCenter.openDashboard", () => {
       DashboardPanel.show(context.extensionUri, store, usage, {
         openSession: (id, newWindow) =>
-          void openSession(store, context, id, seen, { forceNewWindow: newWindow }),
+          void openSession(store, context, id, seen, archive, { forceNewWindow: newWindow }),
         startClaude: (id) => void newConversationForSession(store, context, id),
       });
     }),
     vscode.commands.registerCommand("claudeControlCenter.openSession", (arg) => {
       const ref = sessionFrom(arg);
       if (ref) {
-        void openSession(store, context, ref, seen);
+        void openSession(store, context, ref, seen, archive);
       }
     }),
     vscode.commands.registerCommand("claudeControlCenter.newSessionInProject", (arg) => {
@@ -385,6 +401,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // the 30s tick.
         void seen.sync();
         void titles.sync();
+        void archive.sync();
         // Alt-tabbing into this window with a session's tab already active
         // counts as reviewing it — no tab event fires on a plain window switch.
         markFocusedSessionSeen();

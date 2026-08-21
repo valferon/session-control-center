@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { SessionStore } from "../data/sessionStore";
 import { SeenStore } from "../data/seenStore";
+import { ArchiveStore } from "../data/archiveStore";
 import { lastActivityMs } from "../data/jsonlParser";
 import { dirExists } from "../data/paths";
 import { Session } from "../model/types";
@@ -142,6 +143,7 @@ export async function openSession(
   context: vscode.ExtensionContext,
   ref: SessionRef,
   seen?: SeenStore,
+  archive?: ArchiveStore,
   opts?: { forceNewWindow?: boolean }
 ): Promise<void> {
   const session = resolveSession(store, ref);
@@ -149,6 +151,11 @@ export async function openSession(
     void vscode.window.showWarningMessage("Session not found (it may have been removed).");
     return;
   }
+  // Opening = un-hiding. The dashboard deliberately lists archived sessions
+  // (that's how you find an old one again), so opening from there must put the
+  // session back in the sidebar — otherwise the conversation you're now in
+  // stays invisible while some neighbouring session wears the active dot.
+  void archive?.unarchive(session.sessionId);
   // Opening = checking it: clear the "new since finished" mark at wall-clock
   // NOW, not at this window's parsed watermark. The parsed watermark can lag
   // the file (watcher latency, parse in flight), so marking at it left the

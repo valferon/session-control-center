@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
 import { ProjectGroup, RunningAgent, RunningWorkflow, Session, UsageWindow } from "../model/types";
 import { SessionStore } from "../data/sessionStore";
+import { lastActivityMs } from "../data/jsonlParser";
 import { UsageService } from "../data/usageService";
 import { ArchiveStore } from "../data/archiveStore";
 import { SeenStore } from "../data/seenStore";
 import { readModelSettings } from "../data/paths";
 import { findSessionForActiveTab } from "../util/activeClaudeTab";
-import { projectUri, WindowRepoDecorations } from "./sessionDecorations";
+import { HEAT_LEVELS, projectUri, sessionUri, SessionHeatDecorations, WindowRepoDecorations } from "./sessionDecorations";
 import { normPath, pathRelated } from "../util/pathMatch";
 import { fmtNum, relTime, truncate } from "../util/fmt";
 
@@ -81,6 +82,9 @@ export class SessionNode extends vscode.TreeItem {
     // Session rows are leaves (no collapse state) and are never reveal()ed by
     // id, so nothing else keys off id stability.
     this.id = `${s.filePath}@${revision}`;
+    // Tagged so SessionHeatDecorations can fade the row by recency. Harmless
+    // when the ramp is off — the provider simply returns no decoration.
+    this.resourceUri = sessionUri(s.sessionId);
     this.description = (archived ? "archived · " : "") + SessionNode.describe(s);
     // Suffix order matters: the `archived` token drives the archive/unarchive
     // menu split via regex in package.json. Keep "session" as the prefix so the
@@ -109,6 +113,8 @@ export class SessionNode extends vscode.TreeItem {
     // typed most recently. An untitled session shows its short id until the
     // ai-title lands, then stays put.
     const raw = s.customTitle || s.title || s.sessionId.slice(0, 8);
+    // The recency mark rides in the badge slot, not here — see
+    // SessionHeatDecorations.
     return max > 0 ? truncate(raw, max) : raw;
   }
 
@@ -117,7 +123,10 @@ export class SessionNode extends vscode.TreeItem {
   // "Current session" section at the top of the tree; putting them on every
   // row just got clipped by the sidebar width.
   private static describe(s: Session): string {
-    const bits: string[] = [relTime(s.mtimeMs)];
+    // Conversational watermark, not raw file mtime: an ai-title regen or a
+    // file-history snapshot bumps mtime and made an hours-old session read as
+    // "15s". Same key the row order and the status logic use.
+    const bits: string[] = [relTime(lastActivityMs(s.aggregates, s.mtimeMs))];
     // One count covering loose agents AND workflow agents — the tree below
     // the row shows the split.
     const live =
@@ -203,7 +212,7 @@ export class SessionNode extends vscode.TreeItem {
         : s.status === "finished"
           ? "finished · checked"
           : s.status;
-    md.appendMarkdown(`Status: **${label}** · ${relTime(s.mtimeMs)}\n\n`);
+    md.appendMarkdown(`Status: **${label}** · ${relTime(lastActivityMs(s.aggregates, s.mtimeMs))}\n\n`);
     if (s.cwd) {
       md.appendMarkdown(`Repo: \`${s.cwd}\`${s.cwdVerified ? "" : " (unverified)"}\n\n`);
     }
@@ -359,6 +368,8 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   private revision = 0;
   // Tints this window's own repo row (instead of hijacking selection).
   readonly decorations = new WindowRepoDecorations();
+  // Fades session rows by recency (see SessionHeatDecorations).
+  readonly heatDecorations = new SessionHeatDecorations();
 
   constructor(
     private readonly store: SessionStore,
@@ -380,6 +391,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     this.view = view;
     this.updateMessage();
     this.decorations.setCurrent(this.currentGroupKeys());
+    this.pushHeat();
   }
 
   refresh(): void {
@@ -419,6 +431,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     }
     this._onDidChangeTreeData.dispose();
     this.decorations.dispose();
+    this.heatDecorations.dispose();
   }
 
   getState(): {
@@ -493,6 +506,30 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   // changes which sessions count as your working set. Rank replaces the old
   // reviewedFreshMinutes time window: "the last 5 I checked" stays lit however
   // long ago that was.
+  private heatEnabled(): boolean {
+    return vscode.workspace
+      .getConfiguration("claudeControlCenter")
+      .get<boolean>("sidebarRecencyHeat", true);
+  }
+
+  // Recompute the ramp for every visible session and hand it to the decoration
+  // provider. Runs on refresh, alongside the repo tint.
+  private pushHeat(): void {
+    if (!this.heatEnabled()) {
+      this.heatDecorations.setLevels(new Map());
+      return;
+    }
+    const levels = new Map<string, number>();
+    for (const g of this.store.getGroups()) {
+      for (const s of g.sessions) {
+        if (this.matches(s)) {
+          levels.set(s.sessionId, heatLevel(s));
+        }
+      }
+    }
+    this.heatDecorations.setLevels(levels);
+  }
+
   private recentFinishedIds(): Set<string> {
     const n = vscode.workspace
       .getConfiguration("claudeControlCenter")
@@ -505,6 +542,10 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         .getGroups()
         .flatMap((g) => g.sessions)
         .filter((s) => s.status === "finished")
+        // RAW mtime on purpose here, unlike the row order and the age label:
+        // this rank is "recently CHECKED", and merely opening a session
+        // rewrites its log (last-prompt/mode records) without adding any
+        // conversation. That touch is exactly the signal wanted.
         .sort((a, b) => b.mtimeMs - a.mtimeMs)
         .slice(0, n)
         .map((s) => s.sessionId)
@@ -695,6 +736,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     this._onDidChangeTreeData.fire();
     // Recompute which project row is this window's repo; no-ops if unchanged.
     this.decorations.setCurrent(this.currentGroupKeys());
+    // …and the recency ramp. Also a no-op when no row changed step, so a quiet
+    // 30s tick repaints nothing.
+    this.pushHeat();
   }
 
   private updateMessage(): void {
@@ -746,9 +790,28 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   }
 }
 
+// Recency cut-offs for the heat ramp, in minutes: under 20 = step 0 (full
+// strength), under 120 = step 1, under 480 = step 2, anything older is the
+// final, uncoloured step. Tuned so a working day leaves a handful of rows lit
+// rather than half the tree.
+const HEAT_CUTOFF_MINUTES = [20, 120, 480];
+
 // Context size where a session lands in the usage panel's ">150k context"
 // bucket — the point where per-turn cost climbs even with caching.
 const CTX_WARN_TOKENS = 150_000;
+
+// Recency step for a session, 0 = hottest. Keyed on the conversational
+// watermark, like the row order and the age label — opening a session rewrites
+// its log without adding conversation, and that must not re-light the row.
+function heatLevel(s: Session): number {
+  const ageMin = (Date.now() - lastActivityMs(s.aggregates, s.mtimeMs)) / 60_000;
+  for (let i = 0; i < HEAT_CUTOFF_MINUTES.length; i++) {
+    if (ageMin < HEAT_CUTOFF_MINUTES[i]) {
+      return i;
+    }
+  }
+  return HEAT_LEVELS - 1;
+}
 
 // Compact family name of the session's most-used model ("" when unknown).
 function shortModel(models: string[]): string {

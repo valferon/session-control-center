@@ -138,7 +138,7 @@ function rangeMetrics(): DashboardMetrics {
 }
 
 function haystack(s: Session, p: ProjectGroup): string {
-  return [s.title, s.lastPrompt, s.gitBranch, s.cwd, s.sessionId, p.label, s.aggregates.models.join(" ")]
+  return [s.customTitle, s.title, s.lastPrompt, s.gitBranch, s.cwd, s.sessionId, p.label, s.aggregates.models.join(" ")]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
@@ -147,7 +147,7 @@ function haystack(s: Session, p: ProjectGroup): string {
 function sortVal(s: Session, p: ProjectGroup, key: SortKey): number | string {
   switch (key) {
     case "activity": return activityMs(s);
-    case "title": return (s.title || s.lastPrompt || s.sessionId).toLowerCase();
+    case "title": return (s.customTitle || s.title || s.sessionId).toLowerCase();
     case "project": return p.label.toLowerCase();
     case "tokens": return totalTokens(s);
     case "cost": return s.costUsd;
@@ -583,9 +583,13 @@ function sessionRow(s: Session, project: ProjectGroup): HTMLElement {
   const titleTd = document.createElement("td");
   titleTd.className = "title-cell";
   const rt = el("div", "row-title");
-  rt.textContent = s.title || s.lastPrompt?.slice(0, 90) || s.sessionId.slice(0, 8);
+  // Rename first, then the ai-title, then the short id — never lastPrompt.
+  // lastPrompt changes every turn, so using it as the title made a row rename
+  // itself to whatever was typed most recently ("continue", "yes") and shuffle
+  // under a title sort. It stays available below, as the subtitle.
+  rt.textContent = s.customTitle || s.title || s.sessionId.slice(0, 8);
   titleTd.append(rt);
-  if (s.lastPrompt && s.title) {
+  if (s.lastPrompt) {
     const sub = el("div", "row-sub");
     sub.textContent = s.lastPrompt.slice(0, 110);
     titleTd.append(sub);

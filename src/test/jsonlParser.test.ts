@@ -8,6 +8,7 @@ import {
   lastActivityMs,
   parseSessionFile,
   probeSidechain,
+  promptText,
   SessionParser,
   StatusThresholds,
 } from "../data/jsonlParser";
@@ -546,4 +547,60 @@ test("lastActivityMs prefers endedAt over mtime", async () => {
   const agg = (await parse([userPrompt(-10 * 60_000), assistantText(-9 * 60_000)])).aggregates;
   assert.equal(lastActivityMs(agg, NOW), NOW - 9 * 60_000);
   assert.equal(lastActivityMs({ ...agg, endedAt: undefined }, 12345), 12345);
+});
+
+// --- promptIndex (tab-label candidates) ---------------------------------------
+
+test("promptText normalises a prompt to a single capped line", () => {
+  assert.equal(promptText({ content: "  todo list?  " }), "todo list?");
+  assert.equal(promptText({ content: [{ type: "text", text: "first\nsecond" }] }), "first");
+  // Slash-command echoes and other angle-bracket wrappers are never tab labels.
+  assert.equal(promptText({ content: "<command-message>x</command-message>" }), undefined);
+  assert.equal(promptText({ content: "   " }), undefined);
+  assert.equal(promptText({ content: [{ type: "tool_result", content: "ok" }] }), undefined);
+  assert.equal(promptText({ content: "x".repeat(200) })?.length, 60);
+});
+
+test("promptIndex keeps recent distinct prompts, oldest first", async () => {
+  const s = await parse([
+    userPrompt(-60_000, "todo list?"),
+    assistantText(-59_000),
+    userPrompt(-50_000, "merge all except 997"),
+    assistantText(-49_000),
+  ]);
+  assert.deepEqual(s.promptIndex, ["todo list?", "merge all except 997"]);
+});
+
+test("promptIndex dedups a repeated prompt to its latest position", async () => {
+  const s = await parse([
+    userPrompt(-60_000, "yes"),
+    assistantText(-59_000),
+    userPrompt(-50_000, "keep going"),
+    assistantText(-49_000),
+    userPrompt(-40_000, "yes"),
+    assistantText(-39_000),
+  ]);
+  assert.deepEqual(s.promptIndex, ["keep going", "yes"]);
+});
+
+test("promptIndex is bounded and drops the oldest entries", async () => {
+  const lines: string[] = [];
+  for (let i = 0; i < 80; i++) {
+    lines.push(userPrompt(-100_000 + i * 100, `prompt ${i}`));
+    lines.push(assistantText(-100_000 + i * 100 + 50));
+  }
+  const s = await parse(lines);
+  assert.equal(s.promptIndex?.length, 64);
+  assert.equal(s.promptIndex?.[0], "prompt 16");
+  assert.equal(s.promptIndex?.at(-1), "prompt 79");
+});
+
+test("tool results and interrupts never enter promptIndex", async () => {
+  const s = await parse([
+    userPrompt(-60_000, "real prompt"),
+    assistantText(-59_000),
+    userToolResult(-50_000),
+    userInterrupt(-40_000),
+  ]);
+  assert.deepEqual(s.promptIndex, ["real prompt"]);
 });

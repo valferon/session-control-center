@@ -143,10 +143,17 @@ export interface Session {
   title?: string;
   // User-chosen title (TitleStore overlay, attached at store read time). UI
   // prefers this over `title`; `title` stays the AI-generated original because
-  // the tab↔session join (activeClaudeTab) matches Claude's own tab labels,
-  // which a rename here can't change.
+  // Claude's own tab labels come from IT, not from a rename here. The
+  // tab↔session join (activeClaudeTab) therefore tries `title` first and only
+  // falls back to this — a rename that happens to equal the tab label still
+  // joins, but can never outrank a real ai-title match.
   customTitle?: string;
   lastPrompt?: string;
+  // Recent distinct human prompts (oldest first, bounded), kept solely as
+  // tab-label candidates for the tab↔session join: Claude's conversation panel
+  // labels an untitled session with the first prompt typed IN THAT PANEL, so
+  // neither `title` nor `lastPrompt` can identify it. Not for display.
+  promptIndex?: string[];
   status: SessionStatus;
   mtimeMs: number;
   sizeBytes: number;

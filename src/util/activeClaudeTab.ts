@@ -54,10 +54,11 @@ function sessionFromLogPath(fsPath: string, store: SessionStore): Session | unde
 }
 
 // The session shown in the currently focused editor tab, if that tab is a
-// Claude conversation panel whose label matches a known session title.
-// Best-effort by design: untitled sessions and renamed tabs return undefined.
-// Ties (same title reused across sessions) resolve to the most recently
-// written session — overwhelmingly the one you actually have open.
+// Claude conversation panel whose label matches a known session — by ai-title,
+// by a rename, or (for untitled sessions, which Claude labels with a prompt)
+// by the session's remembered prompts. Best-effort by design: an ambiguous
+// label returns undefined rather than a guess. Ties on the strong keys resolve
+// to the most recently written session — overwhelmingly the one you have open.
 export function findActiveClaudeSession(store: SessionStore): Session | undefined {
   const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
   const input = tab?.input;
@@ -68,27 +69,48 @@ export function findActiveClaudeSession(store: SessionStore): Session | undefine
   if (!label) {
     return undefined;
   }
-  // Exact title match first (the pre-existing join; unchanged semantics).
+  // Three exact-match passes, strongest first. They never blend: a weaker
+  // pass is consulted only when the stronger one found nothing at all.
+  //   1. ai-title    — Claude's own label for a titled session (the original
+  //                    join; unchanged semantics).
+  //   2. customTitle — a rename here can't change Claude's tab label, so this
+  //                    only fires when you renamed the session to what the tab
+  //                    already says. Must never outrank a real ai-title match.
+  //   3. promptIndex — an UNTITLED session's panel is labelled with the first
+  //                    prompt typed in it, which is no field of its own. This
+  //                    is the only way such a session joins at all, and it is
+  //                    the loosest key (short prompts like "go" recur across
+  //                    sessions), so it carries the fuzzy pass's guards:
+  //                    in-workspace, and unambiguous.
   let exact: Session | undefined;
+  let exactCustom: Session | undefined;
+  const byPrompt: Session[] = [];
   const fuzzy: Session[] = [];
   const prefix = truncatedPrefix(label);
   for (const g of store.getGroups()) {
     for (const s of g.sessions) {
       const title = s.title?.trim();
-      if (!title) {
-        continue;
-      }
+      const custom = s.customTitle?.trim();
       if (title === label) {
         if (!exact || s.mtimeMs > exact.mtimeMs) {
           exact = s;
         }
-      } else if (prefix !== undefined && title.startsWith(prefix)) {
+      } else if (custom === label) {
+        if (!exactCustom || s.mtimeMs > exactCustom.mtimeMs) {
+          exactCustom = s;
+        }
+      } else if (
+        prefix !== undefined &&
+        ((title && title.startsWith(prefix)) || (custom && custom.startsWith(prefix)))
+      ) {
         fuzzy.push(s);
+      } else if (matchesPrompt(s, label, prefix)) {
+        byPrompt.push(s);
       }
     }
   }
-  if (exact) {
-    return exact;
+  if (exact ?? exactCustom) {
+    return exact ?? exactCustom;
   }
   // Fuzzy (ellipsis-truncated label) is a weaker signal — generated titles
   // share long prefixes ("Fix …", "Refactor …"), so guard it twice: the
@@ -98,17 +120,37 @@ export function findActiveClaudeSession(store: SessionStore): Session | undefine
   // strictly worse than requiring an explicit click.
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => normPath(f.uri.fsPath));
   const inWorkspace = fuzzy.filter((s) => s.cwd && folders.some((f) => pathRelated(normPath(s.cwd!), f)));
-  const titles = new Set(inWorkspace.map((s) => s.title!.trim()));
-  if (titles.size !== 1) {
-    return undefined;
-  }
-  let best: Session | undefined;
-  for (const s of inWorkspace) {
-    if (!best || s.mtimeMs > best.mtimeMs) {
-      best = s;
+  const titles = new Set(inWorkspace.map((s) => (s.customTitle ?? s.title ?? "").trim()));
+  if (titles.size === 1) {
+    let best: Session | undefined;
+    for (const s of inWorkspace) {
+      if (!best || s.mtimeMs > best.mtimeMs) {
+        best = s;
+      }
     }
+    return best;
   }
-  return best;
+  // Prompt-keyed fallback, same reasoning as the fuzzy pass and then some: the
+  // label must belong to exactly ONE in-workspace session, or we bail. Nothing
+  // else identifies an untitled session, so "no answer" is the alternative,
+  // not a better answer.
+  const promptCandidates = byPrompt.filter(
+    (s) => s.cwd && folders.some((f) => pathRelated(normPath(s.cwd!), f))
+  );
+  const ids = new Set(promptCandidates.map((s) => s.sessionId));
+  return ids.size === 1 ? promptCandidates[0] : undefined;
+}
+
+// Does one of the session's remembered prompts equal the tab label (or, for an
+// ellipsis-truncated label, start with it)? Guarded by a minimum length so a
+// one-word prompt ("go", "yes") — which every session has — can't join.
+const MIN_PROMPT_MATCH = 4;
+
+function matchesPrompt(s: Session, label: string, prefix?: string): boolean {
+  if (!s.promptIndex || label.length < MIN_PROMPT_MATCH) {
+    return false;
+  }
+  return s.promptIndex.some((p) => p === label || (prefix !== undefined && p.startsWith(prefix)));
 }
 
 // Prefix carried by an ellipsis-truncated tab label (long titles get cut in
